@@ -1,0 +1,7 @@
+streamlit
+groq
+chromadb
+sentence-transformers
+pypdf
+rank-bm25
+python-dotenv
