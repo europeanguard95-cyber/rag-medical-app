@@ -1,6 +1,6 @@
 streamlit
 groq
-chromadb
+pinecone
 sentence-transformers
 pypdf
 rank-bm25
