@@ -13,7 +13,7 @@ GROQ_API_KEY     = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY", ""))
 PINECONE_INDEX   = "rag-medical"
 
-st.set_page_config(page_title="RAG Médical test", page_icon="🏥", layout="centered")
+st.set_page_config(page_title="RAG professionnel", page_icon="🏥", layout="centered")
 
 st.markdown("""
 <style>
