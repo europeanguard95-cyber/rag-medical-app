@@ -420,7 +420,7 @@ if "logged_in" not in st.session_state:
 
 if not st.session_state.logged_in:
     st.title("🏥 RAG professionel")
-    st.caption("Suite complète d'outils RAG pour la santé")
+    st.caption("Suite complète d'outils RAG pour les professionnels")
     st.divider()
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
