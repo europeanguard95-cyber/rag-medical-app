@@ -17,5 +17,13 @@ jobs:
       - name: Installer les dependances
         run: pip install streamlit groq sentence-transformers pypdf rank-bm25 pinecone pytest
 
+      - name: Creer le fichier secrets
+        run: |
+          mkdir -p .streamlit
+          echo '[secrets]' > .streamlit/secrets.toml
+          echo 'GROQ_API_KEY = "test_key"' >> .streamlit/secrets.toml
+          echo 'PINECONE_API_KEY = "test_key"' >> .streamlit/secrets.toml
+          echo 'PINECONE_INDEX = "rag-medical"' >> .streamlit/secrets.toml
+
       - name: Lancer les tests
         run: pytest test_chunker.py test_auth.py test_pipeline.py -v
