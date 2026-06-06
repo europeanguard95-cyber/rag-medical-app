@@ -792,10 +792,10 @@ elif choix == "🏠 Estimation Immobilière":
         with col1:
             surface     = st.number_input("Surface (m²)", min_value=10, max_value=500, value=75)
             nb_pieces   = st.selectbox("Nombre de pièces", [1, 2, 3, 4, 5, 6], index=2)
-       with col2:
+        with col2:
             adresse_bien = st.text_input("Adresse complète", placeholder="Ex: 12 rue de la Paix, Centre-Ville")
             quartier     = adresse_bien.split(",")[-1].strip() if "," in adresse_bien else adresse_bien
-            type_bien    = st.selectbox("Type de bien", ["Appartement", "Maison", "Studio", "Loft", "Autre"])
+            type_bien   = st.selectbox("Type de bien", ["Appartement", "Maison", "Studio", "Loft", "Autre"])
         with col3:
             etage       = st.number_input("Étage", min_value=0, max_value=30, value=2)
             annee_bien  = st.number_input("Année de construction", min_value=1800, max_value=2024, value=1990)
