@@ -572,16 +572,36 @@ elif choix == "🏠 Accueil":
     st.subheader("Bienvenue, " + nom + " !")
     st.markdown("Choisis un outil dans le menu à gauche.")
     st.divider()
-    cols = st.columns(2)
+
+    # ── Statut des données par module ──
+    nb_docs   = compter_docs()
+    nb_ventes = len(st.session_state.get("ventes_immo", []))
+
+    def statut_badge(ok, label_ok, label_ko):
+        if ok:
+            return "<span style='background:#E1F5EE;color:#085041;font-size:11px;padding:2px 8px;border-radius:12px;font-weight:500'>" + label_ok + "</span>"
+        return "<span style='background:#FCEBEB;color:#A32D2D;font-size:11px;padding:2px 8px;border-radius:12px;font-weight:500'>" + label_ko + "</span>"
+
     outils = [
-        ("💬", "Assistant Q&A", "Pose des questions sur tes documents"),
-        ("📋", "Formateur", "Fiches procédures étape par étape"),
-        ("⚖️", "Comparateur", "Compare deux documents"),
-        ("📝", "Rapports", "Génère des synthèses structurées"),
+        ("💬", "Assistant Q&A",        "Pose des questions sur tes documents",    statut_badge(nb_docs > 0,   str(nb_docs) + " chunks indexés",        "Aucun document indexé")),
+        ("📋", "Formateur",            "Fiches procédures étape par étape",       statut_badge(nb_docs > 0,   str(nb_docs) + " chunks disponibles",     "Aucun document indexé")),
+        ("⚖️", "Comparateur",          "Compare deux documents",                  statut_badge(nb_docs > 1,   str(nb_docs) + " chunks — comparaison OK", "Besoin d'au moins 2 documents")),
+        ("📝", "Rapports",             "Génère des synthèses structurées",        statut_badge(nb_docs > 0,   str(nb_docs) + " chunks disponibles",     "Aucun document indexé")),
+        ("🏠", "Estimation Immobilière","Estimation par ventes comparables",      statut_badge(nb_ventes > 0, str(nb_ventes) + " ventes en base",        "Aucune vente importée")),
     ]
-    for i, (icone, titre_outil, desc) in enumerate(outils):
+
+    cols = st.columns(2)
+    for i, (icone, titre_outil, desc, badge) in enumerate(outils):
         with cols[i % 2]:
-            st.markdown("<div style='padding:1rem;border:0.5px solid var(--color-border-tertiary);border-radius:8px;margin-bottom:12px'><p style='font-size:24px;margin:0'>" + icone + "</p><p style='font-weight:500;margin:4px 0'>" + titre_outil + "</p><p style='font-size:13px;color:var(--color-text-secondary);margin:0'>" + desc + "</p></div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='padding:1rem;border:0.5px solid var(--color-border-tertiary);border-radius:8px;margin-bottom:12px'>"
+                "<p style='font-size:24px;margin:0'>" + icone + "</p>"
+                "<p style='font-weight:500;margin:4px 0'>" + titre_outil + "</p>"
+                "<p style='font-size:13px;color:var(--color-text-secondary);margin:0 0 6px'>" + desc + "</p>"
+                + badge +
+                "</div>",
+                unsafe_allow_html=True
+            )
 
 # ══════════════════════════════════════════════════════════
 # ASSISTANT Q&A
