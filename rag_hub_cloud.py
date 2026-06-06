@@ -386,7 +386,7 @@ st.divider()
 # ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
     st.header("🧭 Navigation")
-    st.markdown("**── VITRINE ──**")
+  st.markdown("**── VITRINE ──**")
     menus_vitrine = ["🏠 Accueil", "🚀 Solution RAG", "💡 Pourquoi un RAG ?"]
     
     st.markdown("**── OUTILS ──**")
