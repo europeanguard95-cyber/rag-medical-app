@@ -1,7 +1,11 @@
 streamlit
 groq
-pinecone
-sentence-transformers
+sentence-transformers==2.7.0
 pypdf
 rank-bm25
 python-dotenv
+numpy==1.26.4
+protobuf==3.20.3
+pinecone
+pandas
+openpyxl
