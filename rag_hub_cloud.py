@@ -6,12 +6,14 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from datetime import date
-import chromadb
+from pinecone import Pinecone, ServerlessSpec
 import time
 import json
 import datetime
 
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+GROQ_API_KEY     = st.secrets.get("GROQ_API_KEY",     os.getenv("GROQ_API_KEY", ""))
+PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY", ""))
+PINECONE_INDEX   = st.secrets.get("PINECONE_INDEX",   os.getenv("PINECONE_INDEX", "rag-medical"))
 
 # ── LOGGING DE TRAÇABILITÉ ─────────────────────────────────
 LOGS_FILE = "/tmp/rag_logs.json"
@@ -46,7 +48,7 @@ def sauvegarder_log(username, role, question, reponse, sources, techniques):
         pass
     return log
 
-st.set_page_config(page_title="RAG Médical", page_icon="🏥", layout="centered")
+st.set_page_config(page_title="RAG Professionnel", page_icon="🏥", layout="centered")
 
 st.markdown("""
 <style>
@@ -168,19 +170,18 @@ def charger_modeles():
     client_groq = Groq(api_key=GROQ_API_KEY)
     model_embed = SentenceTransformer('all-MiniLM-L6-v2')
     reranker    = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    return client_groq, model_embed, reranker
+    pc          = Pinecone(api_key=PINECONE_API_KEY)
+    if PINECONE_INDEX not in [i.name for i in pc.list_indexes()]:
+        pc.create_index(
+            name=PINECONE_INDEX,
+            dimension=384,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+    index = pc.Index(PINECONE_INDEX)
+    return client_groq, model_embed, reranker, index
 
-client_groq, model_embed, reranker = charger_modeles()
-
-if "collection" not in st.session_state:
-    chroma = chromadb.EphemeralClient()
-    try:
-        st.session_state.collection = chroma.get_collection("rag_docs")
-    except:
-        st.session_state.collection = chroma.create_collection("rag_docs")
-    st.session_state.chroma = chroma
-
-collection = st.session_state.collection
+client_groq, model_embed, reranker, pine_index = charger_modeles()
 
 def chunker(texte, taille=500, overlap=80):
     chunks, debut = [], 0
@@ -195,16 +196,35 @@ def indexer_pdf(fichier_upload, nom_fichier):
     reader = PdfReader(fichier_upload)
     texte  = "".join([p.extract_text() + "\n" for p in reader.pages])
     chunks = chunker(texte)
-    existants = collection.count()
+    stats  = pine_index.describe_index_stats()
+    offset = stats.get("total_vector_count", 0)
     for i in range(0, len(chunks), 50):
         batch = chunks[i:i+50]
-        collection.add(
-            documents=batch,
-            embeddings=model_embed.encode(batch).tolist(),
-            metadatas=[{"source": nom_fichier} for _ in batch],
-            ids=["chunk_" + str(existants + i + j) for j in range(len(batch))]
-        )
+        embeds = model_embed.encode(batch).tolist()
+        vectors = [
+            {
+                "id": "chunk_" + str(offset + i + j),
+                "values": embeds[j],
+                "metadata": {"source": nom_fichier, "text": batch[j][:1000]}
+            }
+            for j in range(len(batch))
+        ]
+        pine_index.upsert(vectors=vectors)
     return len(chunks), len(reader.pages)
+
+def compter_docs():
+    try:
+        stats = pine_index.describe_index_stats()
+        return stats.get("total_vector_count", 0)
+    except:
+        return 0
+
+def lister_sources():
+    try:
+        stats = pine_index.describe_index_stats()
+        return stats.get("total_vector_count", 0)
+    except:
+        return 0
 
 # ── TECHNIQUE 1 : HyDE ─────────────────────────────────────
 def generer_hyde(question):
@@ -220,30 +240,29 @@ def generer_hyde(question):
 
 # ── TECHNIQUE 2 : Hybrid Search ────────────────────────────
 def hybrid_search(question, hyde_text=None, sources_filtres=None, n_initial=20):
-    if collection.count() == 0:
+    nb_total = compter_docs()
+    if nb_total == 0:
         return [], []
     texte_embed = hyde_text if hyde_text else question
-    q_emb = model_embed.encode([texte_embed]).tolist()
-    kwargs = {"n_results": min(n_initial, collection.count()), "include": ["documents", "metadatas"]}
-    if sources_filtres and len(sources_filtres) == 1:
-        kwargs["where"] = {"source": sources_filtres[0]}
-    resultats_vect = collection.query(query_embeddings=q_emb, **kwargs)
-    chunks_vect  = resultats_vect["documents"][0]
-    sources_vect = resultats_vect["metadatas"][0]
+    q_emb = model_embed.encode([texte_embed]).tolist()[0]
 
-    tous  = collection.get(include=["documents", "metadatas"])
-    docs, metas = tous["documents"], tous["metadatas"]
-    if sources_filtres:
-        docs  = [d for d, m in zip(docs, metas) if m["source"] in sources_filtres]
-        metas = [m for m in metas if m["source"] in sources_filtres]
-    if not docs:
-        return chunks_vect, sources_vect
+    filter_dict = {"source": {"$in": sources_filtres}} if sources_filtres else None
+    query_kwargs = {"vector": q_emb, "top_k": min(n_initial, nb_total), "include_metadata": True}
+    if filter_dict:
+        query_kwargs["filter"] = filter_dict
 
-    bm25   = BM25Okapi([d.lower().split() for d in docs])
+    resultats = pine_index.query(**query_kwargs)
+    chunks_vect  = [r["metadata"]["text"] for r in resultats["matches"]]
+    sources_vect = [{"source": r["metadata"]["source"]} for r in resultats["matches"]]
+
+    if not chunks_vect:
+        return [], []
+
+    bm25   = BM25Okapi([c.lower().split() for c in chunks_vect])
     scores = bm25.get_scores(question.lower().split())
     top    = scores.argsort()[-n_initial:][::-1]
-    chunks_bm25  = [docs[i] for i in top]
-    sources_bm25 = [metas[i] for i in top]
+    chunks_bm25  = [chunks_vect[i] for i in top]
+    sources_bm25 = [sources_vect[i] for i in top]
 
     scores_f, src_map = {}, {}
     for rank, (c, m) in enumerate(zip(chunks_vect, sources_vect)):
@@ -283,21 +302,24 @@ def appeler_llm(messages, max_tokens=500, retries=3):
                 return "Erreur : " + str(e)
     return "Service temporairement indisponible. Réessaie dans quelques secondes."
 
-# ── PIPELINE RAG AVEC LES 3 TECHNIQUES ────────────────────
+# ── PIPELINE RAG ──────────────────────────────────────────
 def rag_query(question, role, n_chunks=5, use_hyde=True, use_hybrid=True, use_reranking=True, sources_filtres=None):
-    hyde_text = None
-    if use_hyde:
-        hyde_text = generer_hyde(question)
+    hyde_text = generer_hyde(question) if use_hyde else None
 
     if use_hybrid:
         chunks_c, sources_c = hybrid_search(question, hyde_text, sources_filtres, n_initial=20)
     else:
-        q_emb = model_embed.encode([question]).tolist()
-        kwargs = {"n_results": min(20, collection.count()), "include": ["documents", "metadatas"]}
-        if sources_filtres and len(sources_filtres) == 1:
-            kwargs["where"] = {"source": sources_filtres[0]}
-        r = collection.query(query_embeddings=q_emb, **kwargs)
-        chunks_c, sources_c = r["documents"][0], r["metadatas"][0]
+        nb = compter_docs()
+        if nb == 0:
+            return "Aucun document indexé.", [], [], None
+        q_emb = model_embed.encode([question]).tolist()[0]
+        filter_dict = {"source": {"$in": sources_filtres}} if sources_filtres else None
+        query_kwargs = {"vector": q_emb, "top_k": min(20, nb), "include_metadata": True}
+        if filter_dict:
+            query_kwargs["filter"] = filter_dict
+        r = pine_index.query(**query_kwargs)
+        chunks_c  = [m["metadata"]["text"] for m in r["matches"]]
+        sources_c = [{"source": m["metadata"]["source"]} for m in r["matches"]]
 
     if use_reranking and len(chunks_c) > n_chunks:
         chunks_f, sources_f = rerank(question, chunks_c, sources_c, n_chunks)
@@ -318,8 +340,8 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
-    st.title("🏥 RAG Médical")
-    st.caption("Suite complète d'outils RAG pour la santé")
+    st.title("🏥 RAG Professionnel")
+    st.caption("Suite complète d'outils RAG pour les professionnels")
     st.divider()
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -338,7 +360,6 @@ if not st.session_state.logged_in:
             else:
                 st.error("Identifiant ou mot de passe incorrect")
         st.divider()
-        st.caption("admin / admin123 · soignant1 / soignant123 · patient1 / patient123")
     st.stop()
 
 # ══════════════════════════════════════════════════════════
@@ -352,7 +373,7 @@ droits   = DROITS[role]
 badge = {"admin": "🔴", "soignant": "🟡", "patient": "🟢"}
 col1, col2 = st.columns([3, 1])
 with col1:
-    st.title("🏥 RAG Médical")
+    st.title("🏥 RAG Professionnel")
     st.caption(badge[role] + " " + nom + " — " + role.upper())
 with col2:
     if st.button("🚪 Déconnexion", use_container_width=True):
@@ -384,35 +405,25 @@ with st.sidebar:
         st.header("📄 Ajouter un PDF")
         pdf_up = st.file_uploader("PDF", type=["pdf"], label_visibility="collapsed")
         if pdf_up:
-            nom_f = pdf_up.name
-            deja  = False
-            if collection.count() > 0:
-                test = collection.get(where={"source": nom_f}, limit=1)
-                if test["ids"]:
-                    deja = True
-            if deja:
-                st.info("✅ Déjà indexé")
+            if pdf_up.size > 20_000_000:
+                st.error("Fichier trop lourd — maximum 20 MB")
             else:
                 if st.button("➕ Indexer"):
-                    with st.spinner("Indexation..."):
-                        nb_c, nb_p = indexer_pdf(pdf_up, nom_f)
-                    st.success(str(nb_p) + " pages — " + str(nb_c) + " chunks")
+                    with st.spinner("Indexation dans Pinecone..."):
+                        nb_c, nb_p = indexer_pdf(pdf_up, pdf_up.name)
+                    st.success(str(nb_p) + " pages — " + str(nb_c) + " chunks indexés")
                     st.rerun()
 
     st.divider()
     st.header("📚 Documents")
-    if collection.count() > 0:
-        tous = collection.get(include=["metadatas"])
-        srcs = list(set(m["source"] for m in tous["metadatas"]))
-        for src in srcs:
-            nb = sum(1 for m in tous["metadatas"] if m["source"] == src)
-            st.markdown("• " + src + " (" + str(nb) + ")")
-        st.metric("Total chunks", collection.count())
+    nb_total = compter_docs()
+    if nb_total > 0:
+        st.metric("Total chunks Pinecone", nb_total)
     else:
         st.info("Aucun document")
 
 # ══════════════════════════════════════════════════════════
-# LANDING PAGE PROFESSIONNELLE
+# LANDING PAGE
 # ══════════════════════════════════════════════════════════
 if choix == "🚀 Solution RAG":
 
@@ -422,21 +433,10 @@ if choix == "🚀 Solution RAG":
 .lp-badge{display:inline-block;background:#E6F1FB;color:#0C447C;font-size:11px;font-weight:500;padding:4px 14px;border-radius:20px;margin-bottom:1rem;letter-spacing:0.05em}
 .lp-h1{font-size:26px;font-weight:500;color:var(--color-text-primary);margin:0 0 10px;line-height:1.3}
 .lp-sub{font-size:15px;color:var(--color-text-secondary);margin:0 0 1.5rem;line-height:1.7}
-.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:2rem}
-.metric-card{background:var(--color-background-secondary);border-radius:8px;padding:1.25rem;text-align:center}
-.metric-val{font-size:28px;font-weight:500;color:var(--color-text-primary);margin:0}
-.metric-lbl{font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;line-height:1.4}
 .feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:2rem}
 .feat-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.25rem}
 .feat-title{font-size:14px;font-weight:500;color:var(--color-text-primary);margin:8px 0 4px}
 .feat-desc{font-size:13px;color:var(--color-text-secondary);margin:0;line-height:1.5}
-.roi-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.5rem;margin-bottom:2rem}
-.roi-row{display:flex;align-items:center;gap:12px;margin-bottom:14px}
-.roi-label{font-size:13px;color:var(--color-text-secondary);width:200px}
-.roi-result{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:1rem}
-.roi-res{background:var(--color-background-secondary);border-radius:8px;padding:1rem;text-align:center}
-.roi-res-val{font-size:24px;font-weight:500;color:var(--color-text-primary);margin:0}
-.roi-res-lbl{font-size:12px;color:var(--color-text-secondary);margin:4px 0 0}
 .demo-box{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.5rem;margin-bottom:2rem}
 .demo-q{background:var(--color-background-secondary);border-radius:8px;padding:12px 16px;font-size:13px;color:var(--color-text-secondary);margin-bottom:12px}
 .demo-a{border-left:3px solid #185FA5;padding:12px 16px;font-size:13px;color:var(--color-text-primary);line-height:1.7;border-radius:0 8px 8px 0;background:var(--color-background-secondary)}
@@ -451,7 +451,6 @@ if choix == "🚀 Solution RAG":
 .vs-item{font-size:13px;margin:6px 0;line-height:1.4}
 .vs-bad .vs-item{color:#791F1F}
 .vs-good .vs-item{color:#0F6E56}
-.contact-form{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.5rem}
 .section-lbl{font-size:11px;font-weight:500;color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:0.06em;margin:0 0 12px}
 </style>
 """, unsafe_allow_html=True)
@@ -474,125 +473,70 @@ if choix == "🚀 Solution RAG":
         st.metric("Hallucinations", "0", "chaque réponse cite sa source")
 
     st.divider()
-
     st.markdown('<p class="section-lbl">Calculateur de retour sur investissement</p>', unsafe_allow_html=True)
-    st.markdown('<div class="roi-card">', unsafe_allow_html=True)
     col1, col2 = st.columns([3,1])
     with col1:
-        nb_collab = st.slider("Nombre de collaborateurs concernés", 1, 200, 15, step=1)
+        nb_collab = st.slider("Nombre de collaborateurs", 1, 200, 15)
     with col2:
         st.metric("Collaborateurs", nb_collab)
-
     col1, col2 = st.columns([3,1])
     with col1:
-        h_semaine = st.slider("Heures de recherche documentaire / semaine / personne", 1, 20, 6, step=1)
+        h_semaine = st.slider("Heures recherche / semaine / personne", 1, 20, 6)
     with col2:
         st.metric("Heures/semaine", h_semaine)
-
     col1, col2 = st.columns([3,1])
     with col1:
         cout_h = st.slider("Coût horaire moyen (€)", 20, 150, 55, step=5)
     with col2:
         st.metric("Coût horaire", str(cout_h) + " €")
-
-    gain = 0.73
-    eco_mois = int(nb_collab * h_semaine * cout_h * gain * 4)
+    eco_mois = int(nb_collab * h_semaine * cout_h * 0.73 * 4)
     eco_an   = eco_mois * 12
-
     col1, col2 = st.columns(2)
     with col1:
-        st.success("💰 Économie mensuelle estimée : **" + "{:,}".format(eco_mois).replace(",", " ") + " €**")
+        st.success("💰 Économie mensuelle : **" + "{:,}".format(eco_mois).replace(",", " ") + " €**")
     with col2:
-        st.success("📈 Économie annuelle estimée : **" + "{:,}".format(eco_an).replace(",", " ") + " €**")
-    st.caption("Basé sur 73% de réduction du temps de recherche documentaire (source : McKinsey Digital 2023)")
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.success("📈 Économie annuelle : **" + "{:,}".format(eco_an).replace(",", " ") + " €**")
+    st.caption("Basé sur 73% de réduction du temps de recherche (McKinsey Digital 2023)")
 
     st.divider()
-
     st.markdown('<p class="section-lbl">Exemple concret de réponse sourcée</p>', unsafe_allow_html=True)
-    secteur_demo = st.selectbox("Choisir un secteur", ["🏥 Santé", "⚖️ Juridique", "👥 Ressources humaines", "🎓 Formation"])
-
+    secteur_demo = st.selectbox("Secteur", ["🏥 Santé", "⚖️ Juridique", "👥 Ressources humaines", "🎓 Formation"])
     demos = {
-        "🏥 Santé": {
-            "q": "Quels sont les critères de surveillance selon notre protocole interne ?",
-            "a": "Selon votre protocole de surveillance (révision 2024), les critères incluent : tension artérielle toutes les 4h, fréquence cardiaque, saturation en oxygène et bilan biologique hebdomadaire. En cas de valeur anormale, alerter le médecin responsable dans les 30 minutes.",
-            "src": "protocole_surveillance_2024.pdf — page 12, section 3.2"
-        },
-        "⚖️ Juridique": {
-            "q": "Quelles sont nos obligations contractuelles en matière de délai de livraison ?",
-            "a": "Selon l'article 8.3 de votre contrat-cadre fournisseur, le délai de livraison contractuel est de 15 jours ouvrés. Tout dépassement entraîne une pénalité de 0,5% par jour de retard, plafonnée à 10% du montant total de la commande.",
-            "src": "contrat_cadre_fournisseurs_v3.pdf — article 8.3, page 24"
-        },
-        "👥 Ressources humaines": {
-            "q": "Comment fonctionne la procédure de remboursement des frais professionnels ?",
-            "a": "Selon votre règlement intérieur, les frais professionnels doivent être soumis via le portail RH dans les 30 jours suivant la dépense. Les repas sont remboursés jusqu'à 25€, les transports sur justificatif. Le remboursement est effectué sous 15 jours avec la paie du mois suivant.",
-            "src": "reglement_interieur_2024.pdf — chapitre 5, page 18"
-        },
-        "🎓 Formation": {
-            "q": "Quels sont les prérequis pour accéder au module avancé de gestion de projet ?",
-            "a": "Selon le référentiel de formation, l'accès au module avancé (niveau 3) requiert : avoir validé les modules 1 et 2 avec une note minimale de 12/20, justifier d'au moins 6 mois d'expérience en gestion de projet, et obtenir la validation du responsable formation.",
-            "src": "referentiel_formation_GP_2024.pdf — section 4.1, page 31"
-        }
+        "🏥 Santé": {"q": "Quels sont les critères de surveillance selon notre protocole ?", "a": "Selon votre protocole (révision 2024) : tension artérielle toutes les 4h, fréquence cardiaque, saturation en oxygène et bilan hebdomadaire. Alerter le médecin sous 30 minutes en cas de valeur anormale.", "src": "protocole_surveillance_2024.pdf — page 12"},
+        "⚖️ Juridique": {"q": "Quelles sont nos obligations en matière de délai de livraison ?", "a": "Selon l'article 8.3 du contrat-cadre : délai de 15 jours ouvrés. Pénalité de 0,5% par jour de retard, plafonnée à 10% du montant total.", "src": "contrat_cadre_v3.pdf — article 8.3"},
+        "👥 Ressources humaines": {"q": "Comment fonctionne le remboursement des frais professionnels ?", "a": "Selon le règlement intérieur : soumission via le portail RH sous 30 jours. Repas remboursés jusqu'à 25€, transports sur justificatif. Remboursement sous 15 jours.", "src": "reglement_interieur_2024.pdf — chapitre 5"},
+        "🎓 Formation": {"q": "Quels sont les prérequis pour le module avancé ?", "a": "Modules 1 et 2 validés avec 12/20 minimum, 6 mois d'expérience en gestion de projet, validation du responsable formation.", "src": "referentiel_formation_2024.pdf — section 4.1"}
     }
-
     d = demos[secteur_demo]
-    st.markdown("""
-<div class="demo-box">
-<div class="demo-q">❓ """ + d["q"] + """</div>
-<div class="demo-a">""" + d["a"] + """<div class="demo-src">📎 Source : """ + d["src"] + """</div></div>
-</div>
-""", unsafe_allow_html=True)
+    st.markdown('<div class="demo-box"><div class="demo-q">❓ ' + d["q"] + '</div><div class="demo-a">' + d["a"] + '<div class="demo-src">📎 Source : ' + d["src"] + '</div></div></div>', unsafe_allow_html=True)
 
     st.divider()
-
-    st.markdown('<p class="section-lbl">Ce que vous pouvez faire avec cette solution</p>', unsafe_allow_html=True)
-    st.markdown("""
-<div class="feat-grid">
-<div class="feat-card"><p style="font-size:20px;margin:0">🔍</p><p class="feat-title">Recherche intelligente</p><p class="feat-desc">Posez des questions en langage naturel sur l'ensemble de vos documents internes</p></div>
-<div class="feat-card"><p style="font-size:20px;margin:0">📋</p><p class="feat-title">Génération de rapports</p><p class="feat-desc">Synthèses, comptes-rendus et notes structurées générées automatiquement</p></div>
-<div class="feat-card"><p style="font-size:20px;margin:0">⚖️</p><p class="feat-title">Comparaison de documents</p><p class="feat-desc">Détectez les divergences entre versions, protocoles ou contrats en quelques secondes</p></div>
-<div class="feat-card"><p style="font-size:20px;margin:0">🔐</p><p class="feat-title">Sécurité multi-niveaux</p><p class="feat-desc">Droits par rôle, données hébergées on-premise ou cloud privé selon vos contraintes</p></div>
-<div class="feat-card"><p style="font-size:20px;margin:0">🧠</p><p class="feat-title">Techniques avancées</p><p class="feat-desc">HyDE, Hybrid Search, Re-ranking — les meilleures réponses, pas juste les plus rapides</p></div>
-<div class="feat-card"><p style="font-size:20px;margin:0">⚡</p><p class="feat-title">Déploiement rapide</p><p class="feat-desc">Opérationnel en quelques jours sur vos documents existants, sans refonte IT</p></div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.divider()
-
-    st.markdown('<p class="section-lbl">IA généraliste vs RAG sur vos données</p>', unsafe_allow_html=True)
     st.markdown("""
 <div class="vs-grid">
-<div class="vs-card vs-bad">
-<p class="vs-title">❌ IA généraliste (ChatGPT…)</p>
+<div class="vs-card vs-bad"><p class="vs-title">❌ IA généraliste</p>
 <p class="vs-item">• Ne connaît pas vos documents</p>
 <p class="vs-item">• Peut inventer des informations</p>
-<p class="vs-item">• Vos données envoyées à l'extérieur</p>
-<p class="vs-item">• Réponses génériques, non sourcées</p>
-<p class="vs-item">• Aucune traçabilité</p>
-</div>
-<div class="vs-card vs-good">
-<p class="vs-title">✅ RAG sur vos données</p>
+<p class="vs-item">• Données envoyées à l'extérieur</p>
+<p class="vs-item">• Aucune traçabilité</p></div>
+<div class="vs-card vs-good"><p class="vs-title">✅ RAG sur vos données</p>
 <p class="vs-item">• Connecté à vos documents internes</p>
 <p class="vs-item">• Ancré dans vos sources réelles</p>
-<p class="vs-item">• Hébergeable en local (on-premise)</p>
-<p class="vs-item">• Chaque réponse cite sa source</p>
-<p class="vs-item">• Accès contrôlé par rôle</p>
-</div>
+<p class="vs-item">• Hébergeable en local</p>
+<p class="vs-item">• Chaque réponse cite sa source</p></div>
 </div>
 """, unsafe_allow_html=True)
 
     st.divider()
-
     st.markdown('<p class="section-lbl">Demander une démonstration gratuite</p>', unsafe_allow_html=True)
     with st.form("contact_form"):
         col1, col2 = st.columns(2)
         with col1:
-            prenom_nom  = st.text_input("Prénom et nom")
-            email       = st.text_input("Email professionnel")
+            prenom_nom = st.text_input("Prénom et nom")
+            email      = st.text_input("Email professionnel")
         with col2:
-            entreprise  = st.text_input("Entreprise / Organisation")
-            secteur_c   = st.selectbox("Secteur", ["Santé", "Juridique", "RH / Formation", "Industrie", "Retail", "Autre"])
-        besoin = st.text_area("Votre besoin en quelques mots", placeholder="Ex : automatiser la recherche dans nos 500 procédures internes...", height=80)
+            entreprise = st.text_input("Entreprise / Organisation")
+            secteur_c  = st.selectbox("Secteur", ["Santé", "Juridique", "RH / Formation", "Industrie", "Autre"])
+        besoin  = st.text_area("Votre besoin", height=80)
         envoyer = st.form_submit_button("📩 Demander une démonstration gratuite", use_container_width=True, type="primary")
         if envoyer:
             if prenom_nom and email and entreprise:
@@ -608,132 +552,26 @@ elif choix == "💡 Pourquoi un RAG ?":
     st.subheader("💡 Pourquoi un RAG pour votre organisation ?")
     st.caption("RAG = Retrieval-Augmented Generation — l'IA qui connaît VOS documents")
     st.divider()
-
     st.markdown("""
 ### Le problème des IA classiques
 
-Les assistants IA comme ChatGPT sont puissants, mais ils ont **3 limites critiques** pour une entreprise :
-
 | Limite | Impact concret |
 |---|---|
-| 🔴 **Date de coupure** | Ne connaît pas vos derniers protocoles, circulaires, mises à jour |
-| 🔴 **Hallucinations** | Invente des réponses avec confiance — dangereux en contexte professionnel |
-| 🔴 **Données privées** | Ne connaît pas vos documents internes, vos procédures, votre base de connaissances |
-
----
-
-### Ce que change un RAG
-
-Un RAG connecte l'IA à **vos propres documents**. Au lieu de répondre depuis sa mémoire générale, il **cherche d'abord dans vos sources**, puis génère une réponse ancrée dans vos données.
+| 🔴 **Date de coupure** | Ne connaît pas vos derniers protocoles, mises à jour |
+| 🔴 **Hallucinations** | Invente des réponses — dangereux en contexte professionnel |
+| 🔴 **Données privées** | Ne connaît pas vos documents internes |
 """)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("""
-<div style='padding:1rem; border:0.5px solid var(--color-border-tertiary); border-radius:8px; text-align:center;'>
-<p style='font-size:28px; margin:0;'>📄</p>
-<p style='font-weight:500; margin:8px 0 4px;'>Vos documents</p>
-<p style='font-size:13px; color:var(--color-text-secondary); margin:0;'>Protocoles, guides, contrats, formations, rapports</p>
-</div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown("""
-<div style='padding:1rem; border:0.5px solid var(--color-border-tertiary); border-radius:8px; text-align:center;'>
-<p style='font-size:28px; margin:0;'>🧠</p>
-<p style='font-weight:500; margin:8px 0 4px;'>Le RAG</p>
-<p style='font-size:13px; color:var(--color-text-secondary); margin:0;'>Cherche, analyse et synthétise en temps réel</p>
-</div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown("""
-<div style='padding:1rem; border:0.5px solid var(--color-border-tertiary); border-radius:8px; text-align:center;'>
-<p style='font-size:28px; margin:0;'>✅</p>
-<p style='font-weight:500; margin:8px 0 4px;'>Réponses fiables</p>
-<p style='font-size:13px; color:var(--color-text-secondary); margin:0;'>Sourcées, vérifiables, adaptées à votre contexte</p>
-</div>""", unsafe_allow_html=True)
-
-    st.divider()
-
-    st.markdown("### Cas d'usage concrets par secteur")
-
     tab1, tab2, tab3, tab4 = st.tabs(["🏥 Santé", "⚖️ Juridique", "🏢 Entreprise", "🎓 Formation"])
-
     with tab1:
-        st.markdown("""
-**Pour les professionnels de santé :**
-- Interroger des centaines de protocoles en langage naturel
-- Générer des fiches procédures à jour depuis les recommandations HAS
-- Comparer des versions de guides cliniques
-- Former les équipes sur les nouvelles procédures
-- Répondre aux questions des patients avec des sources vérifiées
-
-> *"Quels sont les critères de surveillance de la pré-éclampsie selon le protocole en vigueur ?"*
-> → Le RAG trouve la bonne page dans vos 300 pages de protocoles en 2 secondes.
-""")
-
+        st.markdown("- Interroger 300 pages de protocoles en langage naturel\n- Générer des fiches procédures à jour\n- Former les équipes sur les nouvelles procédures\n\n> *Le RAG trouve la bonne page en 2 secondes.*")
     with tab2:
-        st.markdown("""
-**Pour les équipes juridiques :**
-- Analyser des contrats et extraire les clauses clés
-- Comparer des versions de documents légaux
-- Répondre aux questions sur la réglementation en vigueur
-- Générer des synthèses de dossiers complexes
-- Former les collaborateurs sur les nouvelles lois
-
-> *"Quelles sont les obligations de l'employeur en matière de RGPD selon notre politique interne ?"*
-> → Réponse extraite directement de vos documents internes, jamais inventée.
-""")
-
+        st.markdown("- Analyser et comparer des contrats\n- Extraire les clauses clés\n- Répondre aux questions réglementaires\n\n> *Réponse extraite de vos documents, jamais inventée.*")
     with tab3:
-        st.markdown("""
-**Pour les entreprises :**
-- Base de connaissances RH accessible en langage naturel
-- Onboarding des nouveaux collaborateurs sur vos procédures
-- Support client automatisé depuis votre documentation produit
-- Analyse de rapports et synthèses exécutives automatiques
-- Gestion des connaissances internes sans perte d'expertise
-
-> *"Quelle est la procédure de remboursement des frais professionnels selon notre règlement intérieur ?"*
-> → Réponse immédiate, sourcée, sans appeler les RH.
-""")
-
+        st.markdown("- Base de connaissances RH accessible 24h/24\n- Onboarding automatisé\n- Support depuis votre documentation produit\n\n> *Réponse immédiate, sourcée, sans appeler les RH.*")
     with tab4:
-        st.markdown("""
-**Pour les organismes de formation :**
-- Créer des parcours pédagogiques depuis vos supports existants
-- Répondre aux questions des apprenants 24h/24
-- Générer des évaluations et fiches mémo depuis vos contenus
-- Adapter le niveau de réponse selon le public
-- Valoriser votre capital documentaire existant
-
-> *"Explique-moi la réglementation sur le temps de travail comme si j'étais un stagiaire de 1ère année"*
-> → Le RAG adapte le langage au niveau demandé tout en restant dans vos documents.
-""")
-
+        st.markdown("- Créer des parcours pédagogiques depuis vos supports\n- Répondre aux apprenants à toute heure\n- Adapter le niveau selon le public\n\n> *Le RAG adapte le langage au niveau demandé.*")
     st.divider()
-
-    st.markdown("### Pourquoi choisir un RAG plutôt qu'une IA généraliste ?")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("""
-**❌ IA généraliste (ChatGPT, etc.)**
-- Ne connaît pas vos documents
-- Peut inventer des informations
-- Données envoyées à l'extérieur
-- Réponses génériques
-- Pas de traçabilité des sources
-""")
-    with col2:
-        st.markdown("""
-**✅ RAG sur vos données**
-- Connecté à vos documents
-- Ancré dans vos sources réelles
-- Peut tourner en local (on-premise)
-- Réponses personnalisées à votre contexte
-- Chaque réponse cite sa source
-""")
-
-    st.divider()
-    st.success("🚀 Cette application est un exemple concret de RAG médical — uploadez un PDF dans la sidebar et posez vos premières questions dans l'onglet **Assistant Q&A** !")
+    st.success("🚀 Uploadez un PDF dans la sidebar et posez vos premières questions dans l'onglet **Assistant Q&A** !")
 
 # ══════════════════════════════════════════════════════════
 # ACCUEIL
@@ -751,14 +589,14 @@ elif choix == "🏠 Accueil":
     ]
     for i, (icone, titre_outil, desc) in enumerate(outils):
         with cols[i % 2]:
-            st.markdown("<div style='padding:1rem; border:0.5px solid var(--color-border-tertiary); border-radius:8px; margin-bottom:12px;'><p style='font-size:24px; margin:0;'>" + icone + "</p><p style='font-weight:500; margin:4px 0;'>" + titre_outil + "</p><p style='font-size:13px; color:var(--color-text-secondary); margin:0;'>" + desc + "</p></div>", unsafe_allow_html=True)
+            st.markdown("<div style='padding:1rem;border:0.5px solid var(--color-border-tertiary);border-radius:8px;margin-bottom:12px'><p style='font-size:24px;margin:0'>" + icone + "</p><p style='font-weight:500;margin:4px 0'>" + titre_outil + "</p><p style='font-size:13px;color:var(--color-text-secondary);margin:0'>" + desc + "</p></div>", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
 # RAG 1 — ASSISTANT Q&A
 # ══════════════════════════════════════════════════════════
 elif choix == "💬 Assistant Q&A":
-    st.subheader("💬 Assistant Q&A Médical")
-    if collection.count() == 0:
+    st.subheader("💬 Assistant Q&A")
+    if compter_docs() == 0:
         st.info("Aucun document disponible. L'admin doit uploader des PDFs.")
         st.stop()
 
@@ -786,7 +624,6 @@ elif choix == "💬 Assistant Q&A":
                 reponse, chunks_f, sources_f, hyde_text = rag_query(
                     question, role, n_chunks, use_hyde, use_hybrid, use_reranking
                 )
-
             st.markdown(reponse)
 
             with st.expander("🔬 Détail du pipeline"):
@@ -819,7 +656,7 @@ elif choix == "💬 Assistant Q&A":
 # ══════════════════════════════════════════════════════════
 elif choix == "📋 Formateur":
     st.subheader("📋 Formateur de Procédures")
-    if collection.count() == 0:
+    if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
 
@@ -847,19 +684,9 @@ elif choix == "📋 Formateur":
 # ══════════════════════════════════════════════════════════
 elif choix == "⚖️ Comparateur":
     st.subheader("⚖️ Comparateur de Documents")
-    if collection.count() == 0:
+    if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
-
-    tous = collection.get(include=["metadatas"])
-    srcs = list(set(m["source"] for m in tous["metadatas"]))
-    if len(srcs) < 2:
-        st.warning("Tu as besoin d'au moins 2 documents pour comparer.")
-        st.stop()
-
-    col1, col2 = st.columns(2)
-    with col1: src1 = st.selectbox("Document 1", srcs, index=0)
-    with col2: src2 = st.selectbox("Document 2", [s for s in srcs if s != src1], index=0)
 
     sujet = st.text_input("Sujet de comparaison", placeholder="Ex: Surveillance de la grossesse")
     axe   = st.selectbox("Axe", ["Recommandations cliniques", "Critères de surveillance", "Prise en charge", "Définitions"])
@@ -867,15 +694,18 @@ elif choix == "⚖️ Comparateur":
     if st.button("⚖️ Comparer", type="primary") and sujet.strip():
         with st.spinner("Comparaison..."):
             hyde1 = generer_hyde(sujet) if use_hyde else None
-            c1, s1 = hybrid_search(sujet, hyde1, [src1]) if use_hybrid else ([], [])
-            c2, s2 = hybrid_search(sujet, hyde1, [src2]) if use_hybrid else ([], [])
-            if not c1: c1, s1 = hybrid_search(sujet, None, [src1])
-            if not c2: c2, s2 = hybrid_search(sujet, None, [src2])
-            c1f, _ = rerank(sujet, c1, s1, 5) if use_reranking else (c1[:5], s1[:5])
-            c2f, _ = rerank(sujet, c2, s2, 5) if use_reranking else (c2[:5], s2[:5])
+            chunks_c, sources_c = hybrid_search(sujet, hyde1)
+            chunks_f, sources_f = rerank(sujet, chunks_c, sources_c, 10) if use_reranking else (chunks_c[:10], sources_c[:10])
+            srcs_uniques = list(dict.fromkeys([m["source"] for m in sources_f]))
+            if len(srcs_uniques) < 2:
+                st.warning("Pas assez de documents différents trouvés sur ce sujet.")
+                st.stop()
+            src1, src2 = srcs_uniques[0], srcs_uniques[1]
+            c1f = [c for c, m in zip(chunks_f, sources_f) if m["source"] == src1][:5]
+            c2f = [c for c, m in zip(chunks_f, sources_f) if m["source"] == src2][:5]
             ctx1 = "\n\n".join(["[" + src1 + " — " + str(i+1) + "]\n" + c for i, c in enumerate(c1f)])
             ctx2 = "\n\n".join(["[" + src2 + " — " + str(i+1) + "]\n" + c for i, c in enumerate(c2f)])
-            comparaison = appeler_llm([{"role": "user", "content": "Compare ces deux documents sur : " + sujet + "\nAxe : " + axe + "\n\n--- DOC 1 : " + src1 + " ---\n" + ctx1 + "\n\n--- DOC 2 : " + src2 + " ---\n" + ctx2 + "\n\nStructure :\n## Synthese\n## Points de convergence\n## Points de divergence\n| Critere | " + src1 + " | " + src2 + " |\n|---|---|---|\n## Recommandation\n## Limites"}], max_tokens=900)
+            comparaison = appeler_llm([{"role": "user", "content": "Compare ces deux documents sur : " + sujet + "\nAxe : " + axe + "\n\n--- DOC 1 : " + src1 + " ---\n" + ctx1 + "\n\n--- DOC 2 : " + src2 + " ---\n" + ctx2 + "\n\nStructure :\n## Synthese\n## Points de convergence\n## Points de divergence\n| Critere | " + src1 + " | " + src2 + " |\n|---|---|---|\n## Recommandation"}], max_tokens=900)
         st.markdown(comparaison)
         st.download_button("⬇️ Télécharger", data=comparaison, file_name="comparaison_" + sujet[:20].replace(" ", "_") + ".txt", mime="text/plain")
 
@@ -884,7 +714,7 @@ elif choix == "⚖️ Comparateur":
 # ══════════════════════════════════════════════════════════
 elif choix == "📝 Rapports":
     st.subheader("📝 Générateur de Rapports")
-    if collection.count() == 0:
+    if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
 
@@ -896,16 +726,10 @@ elif choix == "📝 Rapports":
     sujet          = st.text_area("Sujet et instructions", height=80)
     contexte_libre = st.text_input("Contexte additionnel (optionnel)")
 
-    tous = collection.get(include=["metadatas"])
-    srcs = list(set(m["source"] for m in tous["metadatas"]))
-    srcs_sel = st.multiselect("Sources (vide = toutes)", srcs)
-
     if st.button("📝 Générer", type="primary") and sujet.strip() and titre.strip():
         with st.spinner("Génération du rapport..."):
-            src_filtres = srcs_sel if srcs_sel else None
             hyde_text   = generer_hyde(sujet) if use_hyde else None
-            chunks_c, sources_c = hybrid_search(sujet, hyde_text, src_filtres, 25) if use_hybrid else ([], [])
-            if not chunks_c: chunks_c, sources_c = hybrid_search(sujet, None, src_filtres, 25)
+            chunks_c, sources_c = hybrid_search(sujet, hyde_text, None, 25)
             chunks_f, sources_f = rerank(sujet, chunks_c, sources_c, 8) if use_reranking else (chunks_c[:8], sources_c[:8])
             contexte = "\n\n".join(["[Source " + str(i+1) + " — " + m["source"] + "]\n" + c for i, (c, m) in enumerate(zip(chunks_f, sources_f))])
             today    = date.today().strftime("%d/%m/%Y")
@@ -914,9 +738,8 @@ elif choix == "📝 Rapports":
         st.download_button("⬇️ Télécharger", data=rapport, file_name=titre[:20].replace(" ", "_") + "_" + date.today().strftime("%Y%m%d") + ".txt", mime="text/plain")
         st.warning("⚠️ Ce rapport doit être relu et validé avant diffusion officielle.")
 
-
 # ══════════════════════════════════════════════════════════
-# LOGS & TRAÇABILITÉ (admin uniquement)
+# LOGS & TRAÇABILITÉ
 # ══════════════════════════════════════════════════════════
 elif choix == "📊 Logs & Traçabilité":
     st.subheader("📊 Logs & Traçabilité")
@@ -932,15 +755,13 @@ elif choix == "📊 Logs & Traçabilité":
     with col1:
         st.metric("Total requêtes", len(logs))
     with col2:
-        users_uniques = len(set(l["user"] for l in logs))
-        st.metric("Utilisateurs actifs", users_uniques)
+        st.metric("Utilisateurs actifs", len(set(l["user"] for l in logs)))
     with col3:
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        req_today = sum(1 for l in logs if l["timestamp"].startswith(today))
-        st.metric("Requêtes aujourd'hui", req_today)
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        st.metric("Requêtes aujourd'hui", sum(1 for l in logs if l["timestamp"].startswith(today_str)))
     with col4:
         hyde_count = sum(1 for l in logs if "HyDE" in l.get("techniques", []))
-        st.metric("HyDE utilisé", f"{hyde_count}/{len(logs)}")
+        st.metric("HyDE utilisé", str(hyde_count) + "/" + str(len(logs)))
 
     st.divider()
 
@@ -950,24 +771,19 @@ elif choix == "📊 Logs & Traçabilité":
     with col2:
         nb_afficher = st.slider("Nombre de logs", 5, 50, 20)
 
-    logs_filtres = logs if filtre_user == "Tous" else [l for l in logs if l["user"] == filtre_user]
+    logs_filtres   = logs if filtre_user == "Tous" else [l for l in logs if l["user"] == filtre_user]
     logs_affichage = list(reversed(logs_filtres))[:nb_afficher]
 
     for log in logs_affichage:
-        with st.expander(f"#{log['id']} — {log['timestamp']} — {log['user']} ({log['role']})"):
-            st.markdown(f"**Question :** {log['question']}")
-            st.markdown(f"**Aperçu réponse :** {log['reponse_preview']}...")
-            st.markdown(f"**Sources utilisées ({log['nb_sources']}) :** {', '.join(log['sources'])}")
-            st.markdown(f"**Techniques :** {', '.join(log['techniques']) if log['techniques'] else 'Standard'}")
+        with st.expander("#" + str(log["id"]) + " — " + log["timestamp"] + " — " + log["user"] + " (" + log["role"] + ")"):
+            st.markdown("**Question :** " + log["question"])
+            st.markdown("**Aperçu réponse :** " + log["reponse_preview"] + "...")
+            st.markdown("**Sources (" + str(log["nb_sources"]) + ") :** " + ", ".join(log["sources"]))
+            st.markdown("**Techniques :** " + (", ".join(log["techniques"]) if log["techniques"] else "Standard"))
 
     st.divider()
     logs_json = json.dumps(logs, ensure_ascii=False, indent=2)
-    st.download_button(
-        "⬇️ Télécharger tous les logs (JSON)",
-        data=logs_json,
-        file_name=f"rag_logs_{datetime.datetime.now().strftime('%Y%m%d')}.json",
-        mime="application/json"
-    )
+    st.download_button("⬇️ Télécharger tous les logs (JSON)", data=logs_json, file_name="rag_logs_" + datetime.datetime.now().strftime("%Y%m%d") + ".json", mime="application/json")
     if st.button("🗑️ Effacer tous les logs", type="secondary"):
         if os.path.exists(LOGS_FILE):
             os.remove(LOGS_FILE)
