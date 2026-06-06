@@ -15,7 +15,7 @@ GROQ_API_KEY     = st.secrets.get("GROQ_API_KEY",     os.getenv("GROQ_API_KEY", 
 PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY", ""))
 PINECONE_INDEX   = st.secrets.get("PINECONE_INDEX",   os.getenv("PINECONE_INDEX", "rag-medical"))
 
-# ── LOGGING DE TRAÇABILITÉ ─────────────────────────────────
+# ── LOGGING ────────────────────────────────────────────────
 LOGS_FILE = "/tmp/rag_logs.json"
 
 def charger_logs():
@@ -63,6 +63,17 @@ st.markdown("""
 section[data-testid="stSidebar"] { z-index: 10; }
 .stMainBlockContainer { z-index: 10; position: relative; }
 header[data-testid="stHeader"] { z-index: 10; background: transparent !important; }
+.nav-section {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 14px 0 2px 0;
+    padding-left: 2px;
+    border-top: 0.5px solid var(--color-border-tertiary);
+    padding-top: 10px;
+}
 </style>
 <canvas id="neural-canvas"></canvas>
 <script>
@@ -199,14 +210,11 @@ def indexer_pdf(fichier_upload, nom_fichier):
     stats  = pine_index.describe_index_stats()
     offset = stats.get("total_vector_count", 0)
     for i in range(0, len(chunks), 50):
-        batch = chunks[i:i+50]
+        batch  = chunks[i:i+50]
         embeds = model_embed.encode(batch).tolist()
         vectors = [
-            {
-                "id": "chunk_" + str(offset + i + j),
-                "values": embeds[j],
-                "metadata": {"source": nom_fichier, "text": batch[j][:1000]}
-            }
+            {"id": "chunk_" + str(offset + i + j), "values": embeds[j],
+             "metadata": {"source": nom_fichier, "text": batch[j][:1000]}}
             for j in range(len(batch))
         ]
         pine_index.upsert(vectors=vectors)
@@ -214,56 +222,41 @@ def indexer_pdf(fichier_upload, nom_fichier):
 
 def compter_docs():
     try:
-        stats = pine_index.describe_index_stats()
-        return stats.get("total_vector_count", 0)
+        return pine_index.describe_index_stats().get("total_vector_count", 0)
     except:
         return 0
 
-def lister_sources():
-    try:
-        stats = pine_index.describe_index_stats()
-        return stats.get("total_vector_count", 0)
-    except:
-        return 0
-
-# ── TECHNIQUE 1 : HyDE ─────────────────────────────────────
 def generer_hyde(question):
     try:
-        response = client_groq.chat.completions.create(
+        r = client_groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": "Genere un court paragraphe documentaire expert qui repond a cette question. Sois factuel et precis.\n\nQuestion : " + question + "\nReponse :"}],
+            messages=[{"role": "user", "content": "Genere un court paragraphe documentaire expert qui repond a cette question.\n\nQuestion : " + question + "\nReponse :"}],
             max_tokens=150
         )
-        return response.choices[0].message.content
+        return r.choices[0].message.content
     except:
         return question
 
-# ── TECHNIQUE 2 : Hybrid Search ────────────────────────────
 def hybrid_search(question, hyde_text=None, sources_filtres=None, n_initial=20):
     nb_total = compter_docs()
     if nb_total == 0:
         return [], []
     texte_embed = hyde_text if hyde_text else question
     q_emb = model_embed.encode([texte_embed]).tolist()[0]
-
     filter_dict = {"source": {"$in": sources_filtres}} if sources_filtres else None
     query_kwargs = {"vector": q_emb, "top_k": min(n_initial, nb_total), "include_metadata": True}
     if filter_dict:
         query_kwargs["filter"] = filter_dict
-
-    resultats = pine_index.query(**query_kwargs)
+    resultats    = pine_index.query(**query_kwargs)
     chunks_vect  = [r["metadata"]["text"] for r in resultats["matches"]]
     sources_vect = [{"source": r["metadata"]["source"]} for r in resultats["matches"]]
-
     if not chunks_vect:
         return [], []
-
     bm25   = BM25Okapi([c.lower().split() for c in chunks_vect])
     scores = bm25.get_scores(question.lower().split())
     top    = scores.argsort()[-n_initial:][::-1]
     chunks_bm25  = [chunks_vect[i] for i in top]
     sources_bm25 = [sources_vect[i] for i in top]
-
     scores_f, src_map = {}, {}
     for rank, (c, m) in enumerate(zip(chunks_vect, sources_vect)):
         scores_f[c] = scores_f.get(c, 0) + 1/(rank+60)
@@ -271,11 +264,9 @@ def hybrid_search(question, hyde_text=None, sources_filtres=None, n_initial=20):
     for rank, (c, m) in enumerate(zip(chunks_bm25, sources_bm25)):
         scores_f[c] = scores_f.get(c, 0) + 1/(rank+60)
         src_map[c]  = m
-
     tries = sorted(scores_f, key=scores_f.get, reverse=True)
     return tries[:n_initial], [src_map[c] for c in tries[:n_initial]]
 
-# ── TECHNIQUE 3 : Re-ranking ───────────────────────────────
 def rerank(question, chunks, sources, n_final=5):
     if not chunks:
         return [], []
@@ -283,31 +274,28 @@ def rerank(question, chunks, sources, n_final=5):
     combined = sorted(zip(chunks, sources, scores), key=lambda x: x[2], reverse=True)
     return [c for c, s, _ in combined[:n_final]], [s for _, s, _ in combined[:n_final]]
 
-# ── APPEL LLM AVEC RETRY ───────────────────────────────────
 def appeler_llm(messages, max_tokens=500, retries=3):
     for attempt in range(retries):
         try:
-            response = client_groq.chat.completions.create(
+            r = client_groq.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
                 max_tokens=max_tokens
             )
-            return response.choices[0].message.content
+            return r.choices[0].message.content
         except Exception as e:
             if "rate_limit" in str(e).lower() and attempt < retries - 1:
                 wait = (attempt + 1) * 3
-                st.toast("Limite Groq atteinte — nouvelle tentative dans " + str(wait) + "s...", icon="⏳")
+                st.toast("Limite Groq — nouvelle tentative dans " + str(wait) + "s...", icon="⏳")
                 time.sleep(wait)
             else:
                 return "Erreur : " + str(e)
-    return "Service temporairement indisponible. Réessaie dans quelques secondes."
+    return "Service temporairement indisponible."
 
-# ── PIPELINE RAG ──────────────────────────────────────────
 def rag_query(question, role, n_chunks=5, use_hyde=True, use_hybrid=True, use_reranking=True, sources_filtres=None):
     hyde_text = generer_hyde(question) if use_hyde else None
-
     if use_hybrid:
-        chunks_c, sources_c = hybrid_search(question, hyde_text, sources_filtres, n_initial=20)
+        chunks_c, sources_c = hybrid_search(question, hyde_text, sources_filtres, 20)
     else:
         nb = compter_docs()
         if nb == 0:
@@ -320,17 +308,14 @@ def rag_query(question, role, n_chunks=5, use_hyde=True, use_hybrid=True, use_re
         r = pine_index.query(**query_kwargs)
         chunks_c  = [m["metadata"]["text"] for m in r["matches"]]
         sources_c = [{"source": m["metadata"]["source"]} for m in r["matches"]]
-
     if use_reranking and len(chunks_c) > n_chunks:
         chunks_f, sources_f = rerank(question, chunks_c, sources_c, n_chunks)
     else:
         chunks_f, sources_f = chunks_c[:n_chunks], sources_c[:n_chunks]
-
     contexte = "\n\n".join(["[Source " + str(i+1) + " — " + m["source"] + "]\n" + c for i, (c, m) in enumerate(zip(chunks_f, sources_f))])
     consigne = "Utilise un langage simple et rassurant." if role == "patient" else "Utilise le vocabulaire clinique precis. Cite tes sources."
     prompt   = "Tu es un assistant medical. " + consigne + " Reponds UNIQUEMENT depuis le contexte.\n\n--- CONTEXTE ---\n" + contexte + "\n--- FIN ---\n\nQUESTION : " + question + "\nREPONSE :"
-
-    reponse = appeler_llm([{"role": "user", "content": prompt}])
+    reponse  = appeler_llm([{"role": "user", "content": prompt}])
     return reponse, chunks_f, sources_f, hyde_text
 
 # ══════════════════════════════════════════════════════════
@@ -386,10 +371,11 @@ st.divider()
 # ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
     st.header("🧭 Navigation")
-  st.markdown("**── VITRINE ──**")
+
+    st.markdown('<p class="nav-section">Vitrine</p>', unsafe_allow_html=True)
     menus_vitrine = ["🏠 Accueil", "🚀 Solution RAG", "💡 Pourquoi un RAG ?"]
-    
-    st.markdown("**── OUTILS ──**")
+
+    st.markdown('<p class="nav-section">Outils</p>', unsafe_allow_html=True)
     menus_outils = ["💬 Assistant Q&A"]
     if droits["generer_rapport"]: menus_outils.append("📋 Formateur")
     if droits["comparer"]:        menus_outils.append("⚖️ Comparateur")
@@ -397,7 +383,7 @@ with st.sidebar:
 
     menus_admin = []
     if role == "admin":
-        st.markdown("**── ADMINISTRATION ──**")
+        st.markdown('<p class="nav-section">Administration</p>', unsafe_allow_html=True)
         menus_admin = ["📊 Logs & Traçabilité"]
 
     menus = menus_vitrine + menus_outils + menus_admin
@@ -405,9 +391,9 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Techniques avancées")
-    use_hyde      = st.toggle("🔮 HyDE", value=True, help="Génère une réponse hypothétique avant de chercher")
+    use_hyde      = st.toggle("🔮 HyDE",         value=True, help="Génère une réponse hypothétique avant de chercher")
     use_hybrid    = st.toggle("🔍 Hybrid Search", value=True, help="Combine recherche vectorielle + mots-clés BM25")
-    use_reranking = st.toggle("⚡ Re-ranking", value=True, help="Re-score les chunks pour plus de précision")
+    use_reranking = st.toggle("⚡ Re-ranking",    value=True, help="Re-score les chunks pour plus de précision")
     n_chunks      = st.slider("Chunks finaux", 2, 8, 5)
 
     st.divider()
@@ -436,17 +422,12 @@ with st.sidebar:
 # LANDING PAGE
 # ══════════════════════════════════════════════════════════
 if choix == "🚀 Solution RAG":
-
     st.markdown("""
 <style>
 .lp-hero{background:var(--color-background-secondary);border-radius:12px;padding:2.5rem 2rem;margin-bottom:1.5rem;text-align:center}
 .lp-badge{display:inline-block;background:#E6F1FB;color:#0C447C;font-size:11px;font-weight:500;padding:4px 14px;border-radius:20px;margin-bottom:1rem;letter-spacing:0.05em}
 .lp-h1{font-size:26px;font-weight:500;color:var(--color-text-primary);margin:0 0 10px;line-height:1.3}
 .lp-sub{font-size:15px;color:var(--color-text-secondary);margin:0 0 1.5rem;line-height:1.7}
-.feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:2rem}
-.feat-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.25rem}
-.feat-title{font-size:14px;font-weight:500;color:var(--color-text-primary);margin:8px 0 4px}
-.feat-desc{font-size:13px;color:var(--color-text-secondary);margin:0;line-height:1.5}
 .demo-box{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:12px;padding:1.5rem;margin-bottom:2rem}
 .demo-q{background:var(--color-background-secondary);border-radius:8px;padding:12px 16px;font-size:13px;color:var(--color-text-secondary);margin-bottom:12px}
 .demo-a{border-left:3px solid #185FA5;padding:12px 16px;font-size:13px;color:var(--color-text-primary);line-height:1.7;border-radius:0 8px 8px 0;background:var(--color-background-secondary)}
@@ -483,7 +464,7 @@ if choix == "🚀 Solution RAG":
         st.metric("Hallucinations", "0", "chaque réponse cite sa source")
 
     st.divider()
-    st.markdown('<p class="section-lbl">Calculateur de retour sur investissement</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-lbl">Calculateur ROI</p>', unsafe_allow_html=True)
     col1, col2 = st.columns([3,1])
     with col1:
         nb_collab = st.slider("Nombre de collaborateurs", 1, 200, 15)
@@ -513,9 +494,9 @@ if choix == "🚀 Solution RAG":
     secteur_demo = st.selectbox("Secteur", ["🏥 Santé", "⚖️ Juridique", "👥 Ressources humaines", "🎓 Formation"])
     demos = {
         "🏥 Santé": {"q": "Quels sont les critères de surveillance selon notre protocole ?", "a": "Selon votre protocole (révision 2024) : tension artérielle toutes les 4h, fréquence cardiaque, saturation en oxygène et bilan hebdomadaire. Alerter le médecin sous 30 minutes en cas de valeur anormale.", "src": "protocole_surveillance_2024.pdf — page 12"},
-        "⚖️ Juridique": {"q": "Quelles sont nos obligations en matière de délai de livraison ?", "a": "Selon l'article 8.3 du contrat-cadre : délai de 15 jours ouvrés. Pénalité de 0,5% par jour de retard, plafonnée à 10% du montant total.", "src": "contrat_cadre_v3.pdf — article 8.3"},
-        "👥 Ressources humaines": {"q": "Comment fonctionne le remboursement des frais professionnels ?", "a": "Selon le règlement intérieur : soumission via le portail RH sous 30 jours. Repas remboursés jusqu'à 25€, transports sur justificatif. Remboursement sous 15 jours.", "src": "reglement_interieur_2024.pdf — chapitre 5"},
-        "🎓 Formation": {"q": "Quels sont les prérequis pour le module avancé ?", "a": "Modules 1 et 2 validés avec 12/20 minimum, 6 mois d'expérience en gestion de projet, validation du responsable formation.", "src": "referentiel_formation_2024.pdf — section 4.1"}
+        "⚖️ Juridique": {"q": "Quelles sont nos obligations en matière de délai de livraison ?", "a": "Selon l'article 8.3 du contrat-cadre : délai de 15 jours ouvrés. Pénalité de 0,5% par jour de retard, plafonnée à 10%.", "src": "contrat_cadre_v3.pdf — article 8.3"},
+        "👥 Ressources humaines": {"q": "Comment fonctionne le remboursement des frais professionnels ?", "a": "Selon le règlement intérieur : soumission via le portail RH sous 30 jours. Repas jusqu'à 25€, transports sur justificatif.", "src": "reglement_interieur_2024.pdf — chapitre 5"},
+        "🎓 Formation": {"q": "Quels sont les prérequis pour le module avancé ?", "a": "Modules 1 et 2 validés avec 12/20 minimum, 6 mois d'expérience, validation du responsable formation.", "src": "referentiel_formation_2024.pdf — section 4.1"}
     }
     d = demos[secteur_demo]
     st.markdown('<div class="demo-box"><div class="demo-q">❓ ' + d["q"] + '</div><div class="demo-a">' + d["a"] + '<div class="demo-src">📎 Source : ' + d["src"] + '</div></div></div>', unsafe_allow_html=True)
@@ -602,7 +583,7 @@ elif choix == "🏠 Accueil":
             st.markdown("<div style='padding:1rem;border:0.5px solid var(--color-border-tertiary);border-radius:8px;margin-bottom:12px'><p style='font-size:24px;margin:0'>" + icone + "</p><p style='font-weight:500;margin:4px 0'>" + titre_outil + "</p><p style='font-size:13px;color:var(--color-text-secondary);margin:0'>" + desc + "</p></div>", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
-# RAG 1 — ASSISTANT Q&A
+# ASSISTANT Q&A
 # ══════════════════════════════════════════════════════════
 elif choix == "💬 Assistant Q&A":
     st.subheader("💬 Assistant Q&A")
@@ -628,14 +609,12 @@ elif choix == "💬 Assistant Q&A":
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
-
         with st.chat_message("assistant"):
             with st.spinner("Pipeline RAG en cours..."):
                 reponse, chunks_f, sources_f, hyde_text = rag_query(
                     question, role, n_chunks, use_hyde, use_hybrid, use_reranking
                 )
             st.markdown(reponse)
-
             with st.expander("🔬 Détail du pipeline"):
                 if use_hyde and hyde_text:
                     st.markdown("**🔮 HyDE activé**")
@@ -643,17 +622,14 @@ elif choix == "💬 Assistant Q&A":
                     st.divider()
                 st.markdown("**🔍 Hybrid Search :** " + ("activé" if use_hybrid else "désactivé"))
                 st.markdown("**⚡ Re-ranking :** " + ("activé" if use_reranking else "désactivé"))
-
             if droits["voir_sources"]:
                 with st.expander("📚 Sources utilisées"):
                     for i, (c, m) in enumerate(zip(chunks_f, sources_f)):
                         st.markdown("**Source " + str(i+1) + " — " + m["source"] + "**")
                         st.text(c[:300] + "..." if len(c) > 300 else c)
                         st.divider()
-
             if role == "patient":
                 st.info("ℹ️ Consultez votre professionnel de santé.")
-
         st.session_state.messages.append({"role": "assistant", "content": reponse})
         techniques_actives = []
         if use_hyde: techniques_actives.append("HyDE")
@@ -662,17 +638,15 @@ elif choix == "💬 Assistant Q&A":
         sauvegarder_log(username, role, question, reponse, sources_f, techniques_actives)
 
 # ══════════════════════════════════════════════════════════
-# RAG 2 — FORMATEUR
+# FORMATEUR
 # ══════════════════════════════════════════════════════════
 elif choix == "📋 Formateur":
     st.subheader("📋 Formateur de Procédures")
     if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
-
     public = st.radio("Public cible", ["Sage-femme / Médecin", "Infirmier(e)", "Patient"], horizontal=True)
     sujet  = st.text_input("Sujet", placeholder="Ex: Surveillance tensionnelle pendant la grossesse")
-
     if st.button("📋 Générer", type="primary") and sujet.strip():
         with st.spinner("Génération..."):
             chunks_c, sources_c = hybrid_search(sujet, generer_hyde(sujet) if use_hyde else None)
@@ -690,17 +664,15 @@ elif choix == "📋 Formateur":
                 st.checkbox(e.strip(), key="chk_" + str(i))
 
 # ══════════════════════════════════════════════════════════
-# RAG 3 — COMPARATEUR
+# COMPARATEUR
 # ══════════════════════════════════════════════════════════
 elif choix == "⚖️ Comparateur":
     st.subheader("⚖️ Comparateur de Documents")
     if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
-
     sujet = st.text_input("Sujet de comparaison", placeholder="Ex: Surveillance de la grossesse")
     axe   = st.selectbox("Axe", ["Recommandations cliniques", "Critères de surveillance", "Prise en charge", "Définitions"])
-
     if st.button("⚖️ Comparer", type="primary") and sujet.strip():
         with st.spinner("Comparaison..."):
             hyde1 = generer_hyde(sujet) if use_hyde else None
@@ -708,7 +680,7 @@ elif choix == "⚖️ Comparateur":
             chunks_f, sources_f = rerank(sujet, chunks_c, sources_c, 10) if use_reranking else (chunks_c[:10], sources_c[:10])
             srcs_uniques = list(dict.fromkeys([m["source"] for m in sources_f]))
             if len(srcs_uniques) < 2:
-                st.warning("Pas assez de documents différents trouvés sur ce sujet.")
+                st.warning("Pas assez de documents différents trouvés.")
                 st.stop()
             src1, src2 = srcs_uniques[0], srcs_uniques[1]
             c1f = [c for c, m in zip(chunks_f, sources_f) if m["source"] == src1][:5]
@@ -720,22 +692,19 @@ elif choix == "⚖️ Comparateur":
         st.download_button("⬇️ Télécharger", data=comparaison, file_name="comparaison_" + sujet[:20].replace(" ", "_") + ".txt", mime="text/plain")
 
 # ══════════════════════════════════════════════════════════
-# RAG 4 — RAPPORTS
+# RAPPORTS
 # ══════════════════════════════════════════════════════════
 elif choix == "📝 Rapports":
     st.subheader("📝 Générateur de Rapports")
     if compter_docs() == 0:
         st.info("Aucun document disponible.")
         st.stop()
-
     col1, col2 = st.columns(2)
     with col1: titre        = st.text_input("Titre", placeholder="Ex: Protocole sage-femme 2024")
     with col2: destinataire = st.text_input("Destinataire", placeholder="Ex: Équipe soignante")
-
     type_rapport   = st.selectbox("Type", ["Synthèse clinique", "Rapport de formation", "Note de synthèse", "Résumé exécutif", "Compte-rendu"])
     sujet          = st.text_area("Sujet et instructions", height=80)
     contexte_libre = st.text_input("Contexte additionnel (optionnel)")
-
     if st.button("📝 Générer", type="primary") and sujet.strip() and titre.strip():
         with st.spinner("Génération du rapport..."):
             hyde_text   = generer_hyde(sujet) if use_hyde else None
@@ -754,13 +723,10 @@ elif choix == "📝 Rapports":
 elif choix == "📊 Logs & Traçabilité":
     st.subheader("📊 Logs & Traçabilité")
     st.caption("Visible uniquement par l'administrateur")
-
     logs = charger_logs()
-
     if not logs:
         st.info("Aucune requête enregistrée pour le moment.")
         st.stop()
-
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total requêtes", len(logs))
@@ -772,25 +738,20 @@ elif choix == "📊 Logs & Traçabilité":
     with col4:
         hyde_count = sum(1 for l in logs if "HyDE" in l.get("techniques", []))
         st.metric("HyDE utilisé", str(hyde_count) + "/" + str(len(logs)))
-
     st.divider()
-
     col1, col2 = st.columns([2, 1])
     with col1:
         filtre_user = st.selectbox("Filtrer par utilisateur", ["Tous"] + list(set(l["user"] for l in logs)))
     with col2:
         nb_afficher = st.slider("Nombre de logs", 5, 50, 20)
-
     logs_filtres   = logs if filtre_user == "Tous" else [l for l in logs if l["user"] == filtre_user]
     logs_affichage = list(reversed(logs_filtres))[:nb_afficher]
-
     for log in logs_affichage:
         with st.expander("#" + str(log["id"]) + " — " + log["timestamp"] + " — " + log["user"] + " (" + log["role"] + ")"):
             st.markdown("**Question :** " + log["question"])
             st.markdown("**Aperçu réponse :** " + log["reponse_preview"] + "...")
             st.markdown("**Sources (" + str(log["nb_sources"]) + ") :** " + ", ".join(log["sources"]))
             st.markdown("**Techniques :** " + (", ".join(log["techniques"]) if log["techniques"] else "Standard"))
-
     st.divider()
     logs_json = json.dumps(logs, ensure_ascii=False, indent=2)
     st.download_button("⬇️ Télécharger tous les logs (JSON)", data=logs_json, file_name="rag_logs_" + datetime.datetime.now().strftime("%Y%m%d") + ".json", mime="application/json")
