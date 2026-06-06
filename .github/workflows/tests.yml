@@ -16,7 +16,6 @@ jobs:
 
       - name: Installer les dépendances de test
         run: |
-          pip install streamlit groq sentence-transformers pypdf rank-bm25 pinecone-client pytest
-
+pip install streamlit groq sentence-transformers pypdf rank-bm25 pinecone pytest
       - name: Lancer les tests
         run: pytest test_chunker.py test_auth.py test_pipeline.py -v
