@@ -386,11 +386,21 @@ st.divider()
 # ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
     st.header("🧭 Navigation")
-    menus = ["🏠 Accueil", "🚀 Solution RAG", "💡 Pourquoi un RAG ?", "💬 Assistant Q&A"]
-    if role == "admin": menus.append("📊 Logs & Traçabilité")
-    if droits["generer_rapport"]: menus.append("📋 Formateur")
-    if droits["comparer"]:        menus.append("⚖️ Comparateur")
-    if droits["generer_rapport"]: menus.append("📝 Rapports")
+    st.markdown("**── VITRINE ──**")
+    menus_vitrine = ["🏠 Accueil", "🚀 Solution RAG", "💡 Pourquoi un RAG ?"]
+    
+    st.markdown("**── OUTILS ──**")
+    menus_outils = ["💬 Assistant Q&A"]
+    if droits["generer_rapport"]: menus_outils.append("📋 Formateur")
+    if droits["comparer"]:        menus_outils.append("⚖️ Comparateur")
+    if droits["generer_rapport"]: menus_outils.append("📝 Rapports")
+
+    menus_admin = []
+    if role == "admin":
+        st.markdown("**── ADMINISTRATION ──**")
+        menus_admin = ["📊 Logs & Traçabilité"]
+
+    menus = menus_vitrine + menus_outils + menus_admin
     choix = st.radio("", menus, label_visibility="collapsed")
 
     st.divider()
