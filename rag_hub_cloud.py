@@ -380,6 +380,7 @@ with st.sidebar:
     if droits["generer_rapport"]: menus_outils.append("📋 Formateur")
     if droits["comparer"]:        menus_outils.append("⚖️ Comparateur")
     if droits["generer_rapport"]: menus_outils.append("📝 Rapports")
+    if droits["generer_rapport"]: menus_outils.append("🏠 Estimation Immobilière")
 
     menus_admin = []
     if role == "admin":
@@ -760,3 +761,245 @@ elif choix == "📊 Logs & Traçabilité":
             os.remove(LOGS_FILE)
         st.success("Logs effacés.")
         st.rerun()
+
+# ══════════════════════════════════════════════════════════
+# MODULE 5 — ESTIMATION IMMOBILIÈRE
+# ══════════════════════════════════════════════════════════
+elif choix == "🏠 Estimation Immobilière":
+    st.subheader("🏠 Estimation Immobilière")
+    st.caption("Estimation basée sur les ventes internes de l'agence")
+
+    import pandas as pd
+    import io
+
+    # ── Initialisation du stockage des ventes ──────────────
+    if "ventes_immo" not in st.session_state:
+        st.session_state.ventes_immo = []
+
+    tab1, tab2, tab3 = st.tabs(["📊 Estimation", "📥 Importer CSV", "✏️ Ajouter une vente"])
+
+    # ──────────────────────────────────────────────────────
+    # TAB 1 : ESTIMATION
+    # ──────────────────────────────────────────────────────
+    with tab1:
+        ventes = st.session_state.ventes_immo
+
+        if not ventes:
+            st.info("Aucune vente enregistrée. Importez un CSV ou ajoutez des ventes manuellement.")
+            st.stop()
+
+        st.markdown("**Décrivez le bien à estimer :**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            surface     = st.number_input("Surface (m²)", min_value=10, max_value=500, value=75)
+            nb_pieces   = st.selectbox("Nombre de pièces", [1, 2, 3, 4, 5, 6], index=2)
+        with col2:
+            quartier    = st.text_input("Quartier / Zone", placeholder="Ex: Centre-Ville")
+            type_bien   = st.selectbox("Type de bien", ["Appartement", "Maison", "Studio", "Loft", "Autre"])
+        with col3:
+            etage       = st.number_input("Étage", min_value=0, max_value=30, value=2)
+            annee_bien  = st.number_input("Année de construction", min_value=1800, max_value=2024, value=1990)
+
+        if st.button("🔍 Estimer le prix", type="primary"):
+            with st.spinner("Analyse des ventes comparables..."):
+
+                # Filtrage des ventes comparables
+                df = pd.DataFrame(ventes)
+                comparables = df.copy()
+
+                # Filtre par type
+                if "type_bien" in df.columns:
+                    comparables = comparables[comparables["type_bien"].str.lower() == type_bien.lower()]
+
+                # Filtre par quartier si renseigné
+                if quartier and "quartier" in df.columns:
+                    mask_quartier = comparables["quartier"].str.lower().str.contains(quartier.lower(), na=False)
+                    if mask_quartier.sum() >= 3:
+                        comparables = comparables[mask_quartier]
+
+                # Filtre par surface proche (±30%)
+                if "surface" in df.columns:
+                    mask_surface = (comparables["surface"] >= surface * 0.70) & (comparables["surface"] <= surface * 1.30)
+                    if mask_surface.sum() >= 3:
+                        comparables = comparables[mask_surface]
+
+                nb_comparables = len(comparables)
+
+                if nb_comparables == 0:
+                    st.warning("Pas assez de ventes comparables. Essayez avec des critères moins restrictifs.")
+                    st.stop()
+
+                # Calcul du prix au m²
+                comparables["prix_m2"] = comparables["prix"] / comparables["surface"]
+                prix_m2_moyen  = comparables["prix_m2"].mean()
+                prix_m2_min    = comparables["prix_m2"].quantile(0.25)
+                prix_m2_max    = comparables["prix_m2"].quantile(0.75)
+
+                # Estimation
+                estimation      = prix_m2_moyen * surface
+                estimation_min  = prix_m2_min * surface
+                estimation_max  = prix_m2_max * surface
+
+                # ── Affichage résultats ──
+                st.divider()
+                st.markdown("### 💰 Résultat de l'estimation")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Estimation basse", "{:,.0f} €".format(estimation_min).replace(",", " "))
+                with col2:
+                    st.metric("Estimation centrale", "{:,.0f} €".format(estimation).replace(",", " "), delta="référence")
+                with col3:
+                    st.metric("Estimation haute", "{:,.0f} €".format(estimation_max).replace(",", " "))
+
+                st.metric("Prix au m² moyen", "{:,.0f} €/m²".format(prix_m2_moyen).replace(",", " "),
+                          delta=str(nb_comparables) + " ventes comparables")
+
+                # ── Ventes comparables citées ──
+                st.divider()
+                st.markdown("### 📋 Ventes comparables utilisées")
+
+                top_comparables = comparables.sort_values("prix_m2").head(10)
+                for _, row in top_comparables.iterrows():
+                    with st.expander(
+                        str(row.get("adresse", "Bien")) + " — " +
+                        "{:,.0f} €".format(row["prix"]).replace(",", " ") +
+                        " (" + str(int(row["surface"])) + " m²)"
+                    ):
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Prix", "{:,.0f} €".format(row["prix"]).replace(",", " "))
+                        with col2:
+                            st.metric("Surface", str(int(row["surface"])) + " m²")
+                        with col3:
+                            st.metric("Prix/m²", "{:,.0f} €".format(row["prix_m2"]).replace(",", " "))
+                        with col4:
+                            st.metric("Quartier", str(row.get("quartier", "N/A")))
+
+                # ── Rapport complet via LLM ──
+                st.divider()
+                st.markdown("### 📈 Analyse du marché local")
+
+                contexte_ventes = "\n".join([
+                    "- " + str(r.get("adresse", "Bien")) + " : " +
+                    str(int(r["surface"])) + "m², " +
+                    str(r.get("nb_pieces", "?")) + " pièces, " +
+                    str(r.get("quartier", "?")) + " → " +
+                    "{:,.0f}€ ({:,.0f}€/m²)".format(r["prix"], r["prix_m2"]).replace(",", " ")
+                    for _, r in top_comparables.iterrows()
+                ])
+
+                prompt_immo = (
+                    "Tu es expert immobilier. Analyse ces ventes comparables et rédige un rapport d'estimation professionnel.\n\n"
+                    "BIEN À ESTIMER :\n"
+                    "- Type : " + type_bien + "\n"
+                    "- Surface : " + str(surface) + " m²\n"
+                    "- Pièces : " + str(nb_pieces) + "\n"
+                    "- Quartier : " + (quartier if quartier else "Non précisé") + "\n"
+                    "- Étage : " + str(etage) + "\n"
+                    "- Année construction : " + str(annee_bien) + "\n\n"
+                    "VENTES COMPARABLES (" + str(nb_comparables) + " ventes) :\n" + contexte_ventes + "\n\n"
+                    "ESTIMATION CALCULÉE :\n"
+                    "- Basse : " + "{:,.0f}€".format(estimation_min).replace(",", " ") + "\n"
+                    "- Centrale : " + "{:,.0f}€".format(estimation).replace(",", " ") + "\n"
+                    "- Haute : " + "{:,.0f}€".format(estimation_max).replace(",", " ") + "\n\n"
+                    "Rédige un rapport avec :\n"
+                    "## Synthèse\n"
+                    "## Analyse du marché local\n"
+                    "## Facteurs influençant le prix\n"
+                    "## Recommandation de prix de vente\n"
+                    "## Points de vigilance"
+                )
+
+                rapport_immo = appeler_llm([{"role": "user", "content": prompt_immo}], max_tokens=800)
+                st.markdown(rapport_immo)
+
+                st.download_button(
+                    "⬇️ Télécharger le rapport",
+                    data=rapport_immo,
+                    file_name="estimation_" + (quartier if quartier else "bien") + "_" + str(surface) + "m2.txt",
+                    mime="text/plain"
+                )
+
+    # ──────────────────────────────────────────────────────
+    # TAB 2 : IMPORT CSV
+    # ──────────────────────────────────────────────────────
+    with tab2:
+        st.markdown("**Format CSV attendu :**")
+        st.code("adresse,prix,surface,nb_pieces,type_bien,quartier,etage,annee_construction,date_vente")
+        st.caption("Exemple : 14 rue Gambetta,245000,68,3,Appartement,Centre-Ville,2,1985,2024-03")
+
+        csv_file = st.file_uploader("Importer un fichier CSV ou Excel", type=["csv", "xlsx"])
+        if csv_file:
+            try:
+                if csv_file.name.endswith(".xlsx"):
+                    df_import = pd.read_excel(csv_file)
+                else:
+                    df_import = pd.read_csv(csv_file, sep=None, engine="python")
+
+                df_import.columns = [c.lower().strip().replace(" ", "_") for c in df_import.columns]
+
+                if "prix" not in df_import.columns or "surface" not in df_import.columns:
+                    st.error("Le fichier doit contenir au minimum les colonnes 'prix' et 'surface'.")
+                else:
+                    df_import["prix"]    = pd.to_numeric(df_import["prix"],    errors="coerce")
+                    df_import["surface"] = pd.to_numeric(df_import["surface"], errors="coerce")
+                    df_import = df_import.dropna(subset=["prix", "surface"])
+
+                    st.success(str(len(df_import)) + " ventes importées avec succès !")
+                    st.dataframe(df_import.head(10), use_container_width=True)
+
+                    if st.button("✅ Valider et ajouter à la base", type="primary"):
+                        nouvelles = df_import.to_dict(orient="records")
+                        st.session_state.ventes_immo.extend(nouvelles)
+                        st.success(str(len(nouvelles)) + " ventes ajoutées ! Total : " + str(len(st.session_state.ventes_immo)))
+                        st.rerun()
+
+            except Exception as e:
+                st.error("Erreur lors de l'import : " + str(e))
+
+        if st.session_state.ventes_immo:
+            st.divider()
+            st.metric("Ventes en base", len(st.session_state.ventes_immo))
+            if st.button("🗑️ Vider la base de ventes", type="secondary"):
+                st.session_state.ventes_immo = []
+                st.rerun()
+
+    # ──────────────────────────────────────────────────────
+    # TAB 3 : SAISIE MANUELLE
+    # ──────────────────────────────────────────────────────
+    with tab3:
+        st.markdown("**Ajouter une vente manuellement :**")
+        with st.form("ajout_vente"):
+            col1, col2 = st.columns(2)
+            with col1:
+                v_adresse  = st.text_input("Adresse", placeholder="14 rue Gambetta")
+                v_prix     = st.number_input("Prix de vente (€)", min_value=10000, max_value=10000000, value=250000, step=5000)
+                v_surface  = st.number_input("Surface (m²)", min_value=10, max_value=1000, value=70)
+                v_pieces   = st.selectbox("Nombre de pièces", [1, 2, 3, 4, 5, 6])
+            with col2:
+                v_type     = st.selectbox("Type de bien", ["Appartement", "Maison", "Studio", "Loft", "Autre"])
+                v_quartier = st.text_input("Quartier", placeholder="Centre-Ville")
+                v_etage    = st.number_input("Étage", min_value=0, max_value=30, value=0)
+                v_date     = st.text_input("Date de vente", placeholder="2024-03")
+
+            ajouter = st.form_submit_button("➕ Ajouter cette vente", type="primary", use_container_width=True)
+            if ajouter:
+                nouvelle_vente = {
+                    "adresse": v_adresse,
+                    "prix": v_prix,
+                    "surface": v_surface,
+                    "nb_pieces": v_pieces,
+                    "type_bien": v_type,
+                    "quartier": v_quartier,
+                    "etage": v_etage,
+                    "date_vente": v_date
+                }
+                st.session_state.ventes_immo.append(nouvelle_vente)
+                st.success("✅ Vente ajoutée ! Total en base : " + str(len(st.session_state.ventes_immo)) + " ventes")
+
+        if st.session_state.ventes_immo:
+            st.divider()
+            st.markdown("**Dernières ventes ajoutées :**")
+            df_display = pd.DataFrame(st.session_state.ventes_immo[-5:])
+            st.dataframe(df_display, use_container_width=True)
