@@ -781,12 +781,11 @@ elif choix == "🏠 Estimation Immobilière":
     # ──────────────────────────────────────────────────────
     # TAB 1 : ESTIMATION
     # ──────────────────────────────────────────────────────
-    with tab1:
+   with tab1:
         ventes = st.session_state.ventes_immo
 
         if not ventes:
             st.info("Aucune vente enregistrée. Importez un CSV ou ajoutez des ventes manuellement.")
-            st.stop()
 
         st.markdown("**Décrivez le bien à estimer :**")
         col1, col2, col3 = st.columns(3)
