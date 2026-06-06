@@ -5,6 +5,11 @@ on: [push]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      GROQ_API_KEY: "test_key_fake"
+      PINECONE_API_KEY: "test_key_fake"
+      PINECONE_INDEX: "rag-medical"
+
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -14,16 +19,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Installer les dependances
-        run: pip install streamlit groq sentence-transformers pypdf rank-bm25 pinecone pytest
-
-      - name: Creer le fichier secrets
+      - name: Creer le fichier secrets Streamlit
         run: |
           mkdir -p .streamlit
-          echo '[secrets]' > .streamlit/secrets.toml
-          echo 'GROQ_API_KEY = "test_key"' >> .streamlit/secrets.toml
-          echo 'PINECONE_API_KEY = "test_key"' >> .streamlit/secrets.toml
-          echo 'PINECONE_INDEX = "rag-medical"' >> .streamlit/secrets.toml
+          printf '[secrets]\nGROQ_API_KEY = "test_key_fake"\nPINECONE_API_KEY = "test_key_fake"\nPINECONE_INDEX = "rag-medical"\n' > .streamlit/secrets.toml
+
+      - name: Installer les dependances
+        run: pip install streamlit groq sentence-transformers pypdf rank-bm25 pinecone pytest
 
       - name: Lancer les tests
         run: pytest test_chunker.py test_auth.py test_pipeline.py -v
