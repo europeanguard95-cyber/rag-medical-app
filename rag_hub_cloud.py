@@ -439,7 +439,6 @@ if not st.session_state.logged_in:
             else:
                 st.error("Identifiant ou mot de passe incorrect")
         st.divider()
-        st.caption("admin / admin123 · soignant1 / soignant123 · patient1 / patient123")
     st.stop()
 
 # ══════════════════════════════════════════════════════════
