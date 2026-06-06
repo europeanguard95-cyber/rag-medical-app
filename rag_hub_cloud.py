@@ -781,7 +781,7 @@ elif choix == "🏠 Estimation Immobilière":
     # ──────────────────────────────────────────────────────
     # TAB 1 : ESTIMATION
     # ──────────────────────────────────────────────────────
-   with tab1:
+    with tab1:
         ventes = st.session_state.ventes_immo
 
         if not ventes:
