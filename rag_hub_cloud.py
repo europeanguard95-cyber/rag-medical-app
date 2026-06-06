@@ -6,14 +6,47 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from datetime import date
-from pinecone import Pinecone, ServerlessSpec
+import chromadb
 import time
+import json
+import datetime
 
-GROQ_API_KEY     = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
-PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY", ""))
-PINECONE_INDEX   = "rag-medical"
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-st.set_page_config(page_title="RAG professionnel", page_icon="🏥", layout="centered")
+# ── LOGGING DE TRAÇABILITÉ ─────────────────────────────────
+LOGS_FILE = "/tmp/rag_logs.json"
+
+def charger_logs():
+    try:
+        if os.path.exists(LOGS_FILE):
+            with open(LOGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except:
+        pass
+    return []
+
+def sauvegarder_log(username, role, question, reponse, sources, techniques):
+    logs = charger_logs()
+    log = {
+        "id": len(logs) + 1,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": username,
+        "role": role,
+        "question": question[:200],
+        "reponse_preview": reponse[:150] if reponse else "",
+        "nb_sources": len(sources),
+        "sources": [m.get("source", "") for m in sources][:3],
+        "techniques": techniques
+    }
+    logs.append(log)
+    try:
+        with open(LOGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(logs[-500:], f, ensure_ascii=False, indent=2)
+    except:
+        pass
+    return log
+
+st.set_page_config(page_title="RAG Médical", page_icon="🏥", layout="centered")
 
 st.markdown("""
 <style>
@@ -112,9 +145,6 @@ header[data-testid="stHeader"] { z-index: 10; background: transparent !important
 </script>
 """, unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════
-# UTILISATEURS & DROITS
-# ══════════════════════════════════════════════════════════
 USERS_DEFAUT = {
     "admin":    {"password": hashlib.sha256("admin123".encode()).hexdigest(), "role": "admin",    "nom": "Administrateur"},
     "soignant1":{"password": hashlib.sha256("soignant123".encode()).hexdigest(), "role": "soignant", "nom": "Dr. Dupont"},
@@ -133,9 +163,6 @@ DROITS = {
     "patient":  {"upload_pdf": False, "voir_sources": False, "generer_rapport": False, "comparer": False}
 }
 
-# ══════════════════════════════════════════════════════════
-# CHARGEMENT MODÈLES & PINECONE
-# ══════════════════════════════════════════════════════════
 @st.cache_resource
 def charger_modeles():
     client_groq = Groq(api_key=GROQ_API_KEY)
@@ -143,99 +170,18 @@ def charger_modeles():
     reranker    = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return client_groq, model_embed, reranker
 
-@st.cache_resource
-def init_pinecone():
-    """Initialise l'index Pinecone (créé automatiquement si absent)."""
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    existing = [idx.name for idx in pc.list_indexes()]
-    if PINECONE_INDEX not in existing:
-        pc.create_index(
-            name=PINECONE_INDEX,
-            dimension=384,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        # Attendre que l'index soit prêt
-        while not pc.describe_index(PINECONE_INDEX).status["ready"]:
-            time.sleep(1)
-    return pc.Index(PINECONE_INDEX)
-
 client_groq, model_embed, reranker = charger_modeles()
-index = init_pinecone()
 
-# ══════════════════════════════════════════════════════════
-# HELPERS PINECONE
-# ══════════════════════════════════════════════════════════
-
-def source_id_prefix(nom_fichier):
-    """Préfixe d'ID stable basé sur le nom de fichier (MD5)."""
-    return "doc_" + hashlib.md5(nom_fichier.encode()).hexdigest()
-
-def get_total_count():
-    """Nombre total de vecteurs dans l'index."""
+if "collection" not in st.session_state:
+    chroma = chromadb.EphemeralClient()
     try:
-        stats = index.describe_index_stats()
-        return stats.total_vector_count
+        st.session_state.collection = chroma.get_collection("rag_docs")
     except:
-        return 0
+        st.session_state.collection = chroma.create_collection("rag_docs")
+    st.session_state.chroma = chroma
 
-def source_deja_indexee(nom_fichier):
-    """Vérifie si le premier chunk d'un PDF est déjà dans Pinecone."""
-    try:
-        premier_id = source_id_prefix(nom_fichier) + "_chunk_0"
-        result = index.fetch(ids=[premier_id])
-        return premier_id in result.vectors
-    except:
-        return False
+collection = st.session_state.collection
 
-def get_all_chunks():
-    """
-    Récupère tous les chunks depuis Pinecone pour le BM25.
-    Résultat mis en cache dans session_state (valide pour la durée de la session).
-    """
-    if "pinecone_all_chunks" in st.session_state:
-        return st.session_state["pinecone_all_chunks"]
-
-    docs, metas, all_ids = [], [], []
-    try:
-        for ids_page in index.list():
-            all_ids.extend(ids_page)
-    except Exception:
-        st.session_state["pinecone_all_chunks"] = ([], [])
-        return [], []
-
-    for i in range(0, len(all_ids), 100):
-        batch = all_ids[i:i+100]
-        try:
-            fetched = index.fetch(ids=batch)
-            for _, vdata in fetched.vectors.items():
-                meta = vdata.metadata or {}
-                if meta.get("text"):
-                    docs.append(meta["text"])
-                    metas.append({"source": meta.get("source", "")})
-        except Exception:
-            pass
-
-    st.session_state["pinecone_all_chunks"] = (docs, metas)
-    return docs, metas
-
-def get_sources_list():
-    """Retourne la liste des sources uniques et le nombre de chunks par source."""
-    docs, metas = get_all_chunks()
-    sources = {}
-    for m in metas:
-        src = m["source"]
-        sources[src] = sources.get(src, 0) + 1
-    return sources
-
-def invalider_cache_chunks():
-    """À appeler après chaque indexation pour forcer le rechargement du cache BM25."""
-    if "pinecone_all_chunks" in st.session_state:
-        del st.session_state["pinecone_all_chunks"]
-
-# ══════════════════════════════════════════════════════════
-# INDEXATION PDF
-# ══════════════════════════════════════════════════════════
 def chunker(texte, taille=500, overlap=80):
     chunks, debut = [], 0
     while debut < len(texte):
@@ -249,30 +195,18 @@ def indexer_pdf(fichier_upload, nom_fichier):
     reader = PdfReader(fichier_upload)
     texte  = "".join([p.extract_text() + "\n" for p in reader.pages])
     chunks = chunker(texte)
-    prefix = source_id_prefix(nom_fichier)
-
+    existants = collection.count()
     for i in range(0, len(chunks), 50):
-        batch   = chunks[i:i+50]
-        embeds  = model_embed.encode(batch).tolist()
-        vectors = [
-            {
-                "id":     prefix + "_chunk_" + str(i + j),
-                "values": embeds[j],
-                "metadata": {
-                    "text":   batch[j],
-                    "source": nom_fichier
-                }
-            }
-            for j in range(len(batch))
-        ]
-        index.upsert(vectors=vectors)
-
-    invalider_cache_chunks()
+        batch = chunks[i:i+50]
+        collection.add(
+            documents=batch,
+            embeddings=model_embed.encode(batch).tolist(),
+            metadatas=[{"source": nom_fichier} for _ in batch],
+            ids=["chunk_" + str(existants + i + j) for j in range(len(batch))]
+        )
     return len(chunks), len(reader.pages)
 
-# ══════════════════════════════════════════════════════════
-# TECHNIQUE 1 : HyDE
-# ══════════════════════════════════════════════════════════
+# ── TECHNIQUE 1 : HyDE ─────────────────────────────────────
 def generer_hyde(question):
     try:
         response = client_groq.chat.completions.create(
@@ -284,70 +218,45 @@ def generer_hyde(question):
     except:
         return question
 
-# ══════════════════════════════════════════════════════════
-# TECHNIQUE 2 : Hybrid Search (Pinecone dense + BM25)
-# ══════════════════════════════════════════════════════════
+# ── TECHNIQUE 2 : Hybrid Search ────────────────────────────
 def hybrid_search(question, hyde_text=None, sources_filtres=None, n_initial=20):
-    if get_total_count() == 0:
+    if collection.count() == 0:
         return [], []
-
     texte_embed = hyde_text if hyde_text else question
-    q_emb = model_embed.encode([texte_embed]).tolist()[0]
-
-    # Filtre Pinecone par source (optionnel)
-    pinecone_filter = None
+    q_emb = model_embed.encode([texte_embed]).tolist()
+    kwargs = {"n_results": min(n_initial, collection.count()), "include": ["documents", "metadatas"]}
     if sources_filtres and len(sources_filtres) == 1:
-        pinecone_filter = {"source": {"$eq": sources_filtres[0]}}
-    elif sources_filtres and len(sources_filtres) > 1:
-        pinecone_filter = {"source": {"$in": sources_filtres}}
+        kwargs["where"] = {"source": sources_filtres[0]}
+    resultats_vect = collection.query(query_embeddings=q_emb, **kwargs)
+    chunks_vect  = resultats_vect["documents"][0]
+    sources_vect = resultats_vect["metadatas"][0]
 
-    # Recherche vectorielle via Pinecone
-    kwargs = dict(
-        vector=q_emb,
-        top_k=min(n_initial, get_total_count()),
-        include_metadata=True
-    )
-    if pinecone_filter:
-        kwargs["filter"] = pinecone_filter
-
-    results_vect = index.query(**kwargs)
-    chunks_vect  = [m.metadata.get("text", "") for m in results_vect.matches]
-    sources_vect = [{"source": m.metadata.get("source", "")} for m in results_vect.matches]
-
-    # Recherche BM25 sur le corpus complet
-    tous_docs, tous_metas = get_all_chunks()
-
-    # Appliquer filtre source pour BM25
+    tous  = collection.get(include=["documents", "metadatas"])
+    docs, metas = tous["documents"], tous["metadatas"]
     if sources_filtres:
-        filtre_docs  = [d for d, m in zip(tous_docs, tous_metas) if m["source"] in sources_filtres]
-        filtre_metas = [m for m in tous_metas if m["source"] in sources_filtres]
-    else:
-        filtre_docs, filtre_metas = tous_docs, tous_metas
-
-    if not filtre_docs:
+        docs  = [d for d, m in zip(docs, metas) if m["source"] in sources_filtres]
+        metas = [m for m in metas if m["source"] in sources_filtres]
+    if not docs:
         return chunks_vect, sources_vect
 
-    bm25   = BM25Okapi([d.lower().split() for d in filtre_docs])
+    bm25   = BM25Okapi([d.lower().split() for d in docs])
     scores = bm25.get_scores(question.lower().split())
     top    = scores.argsort()[-n_initial:][::-1]
-    chunks_bm25  = [filtre_docs[i] for i in top]
-    sources_bm25 = [filtre_metas[i] for i in top]
+    chunks_bm25  = [docs[i] for i in top]
+    sources_bm25 = [metas[i] for i in top]
 
-    # Fusion RRF (Reciprocal Rank Fusion)
     scores_f, src_map = {}, {}
     for rank, (c, m) in enumerate(zip(chunks_vect, sources_vect)):
-        scores_f[c] = scores_f.get(c, 0) + 1 / (rank + 60)
+        scores_f[c] = scores_f.get(c, 0) + 1/(rank+60)
         src_map[c]  = m
     for rank, (c, m) in enumerate(zip(chunks_bm25, sources_bm25)):
-        scores_f[c] = scores_f.get(c, 0) + 1 / (rank + 60)
+        scores_f[c] = scores_f.get(c, 0) + 1/(rank+60)
         src_map[c]  = m
 
     tries = sorted(scores_f, key=scores_f.get, reverse=True)
     return tries[:n_initial], [src_map[c] for c in tries[:n_initial]]
 
-# ══════════════════════════════════════════════════════════
-# TECHNIQUE 3 : Re-ranking
-# ══════════════════════════════════════════════════════════
+# ── TECHNIQUE 3 : Re-ranking ───────────────────────────────
 def rerank(question, chunks, sources, n_final=5):
     if not chunks:
         return [], []
@@ -355,9 +264,7 @@ def rerank(question, chunks, sources, n_final=5):
     combined = sorted(zip(chunks, sources, scores), key=lambda x: x[2], reverse=True)
     return [c for c, s, _ in combined[:n_final]], [s for _, s, _ in combined[:n_final]]
 
-# ══════════════════════════════════════════════════════════
-# APPEL LLM AVEC RETRY
-# ══════════════════════════════════════════════════════════
+# ── APPEL LLM AVEC RETRY ───────────────────────────────────
 def appeler_llm(messages, max_tokens=500, retries=3):
     for attempt in range(retries):
         try:
@@ -376,9 +283,7 @@ def appeler_llm(messages, max_tokens=500, retries=3):
                 return "Erreur : " + str(e)
     return "Service temporairement indisponible. Réessaie dans quelques secondes."
 
-# ══════════════════════════════════════════════════════════
-# PIPELINE RAG COMPLET
-# ══════════════════════════════════════════════════════════
+# ── PIPELINE RAG AVEC LES 3 TECHNIQUES ────────────────────
 def rag_query(question, role, n_chunks=5, use_hyde=True, use_hybrid=True, use_reranking=True, sources_filtres=None):
     hyde_text = None
     if use_hyde:
@@ -387,18 +292,12 @@ def rag_query(question, role, n_chunks=5, use_hyde=True, use_hybrid=True, use_re
     if use_hybrid:
         chunks_c, sources_c = hybrid_search(question, hyde_text, sources_filtres, n_initial=20)
     else:
-        q_emb = model_embed.encode([question]).tolist()[0]
-        pinecone_filter = None
+        q_emb = model_embed.encode([question]).tolist()
+        kwargs = {"n_results": min(20, collection.count()), "include": ["documents", "metadatas"]}
         if sources_filtres and len(sources_filtres) == 1:
-            pinecone_filter = {"source": {"$eq": sources_filtres[0]}}
-        elif sources_filtres and len(sources_filtres) > 1:
-            pinecone_filter = {"source": {"$in": sources_filtres}}
-        kwargs = dict(vector=q_emb, top_k=min(20, get_total_count()), include_metadata=True)
-        if pinecone_filter:
-            kwargs["filter"] = pinecone_filter
-        r = index.query(**kwargs)
-        chunks_c  = [m.metadata.get("text", "") for m in r.matches]
-        sources_c = [{"source": m.metadata.get("source", "")} for m in r.matches]
+            kwargs["where"] = {"source": sources_filtres[0]}
+        r = collection.query(query_embeddings=q_emb, **kwargs)
+        chunks_c, sources_c = r["documents"][0], r["metadatas"][0]
 
     if use_reranking and len(chunks_c) > n_chunks:
         chunks_f, sources_f = rerank(question, chunks_c, sources_c, n_chunks)
@@ -419,8 +318,8 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
-    st.title("🏥 RAG professionel")
-    st.caption("Suite complète d'outils RAG pour les professionnels")
+    st.title("🏥 RAG Médical")
+    st.caption("Suite complète d'outils RAG pour la santé")
     st.divider()
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -439,6 +338,7 @@ if not st.session_state.logged_in:
             else:
                 st.error("Identifiant ou mot de passe incorrect")
         st.divider()
+        st.caption("admin / admin123 · soignant1 / soignant123 · patient1 / patient123")
     st.stop()
 
 # ══════════════════════════════════════════════════════════
@@ -462,12 +362,11 @@ with col2:
 
 st.divider()
 
-# ══════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════
+# ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
     st.header("🧭 Navigation")
     menus = ["🏠 Accueil", "🚀 Solution RAG", "💡 Pourquoi un RAG ?", "💬 Assistant Q&A"]
+    if role == "admin": menus.append("📊 Logs & Traçabilité")
     if droits["generer_rapport"]: menus.append("📋 Formateur")
     if droits["comparer"]:        menus.append("⚖️ Comparateur")
     if droits["generer_rapport"]: menus.append("📝 Rapports")
@@ -486,23 +385,29 @@ with st.sidebar:
         pdf_up = st.file_uploader("PDF", type=["pdf"], label_visibility="collapsed")
         if pdf_up:
             nom_f = pdf_up.name
-            if source_deja_indexee(nom_f):
+            deja  = False
+            if collection.count() > 0:
+                test = collection.get(where={"source": nom_f}, limit=1)
+                if test["ids"]:
+                    deja = True
+            if deja:
                 st.info("✅ Déjà indexé")
             else:
                 if st.button("➕ Indexer"):
-                    with st.spinner("Indexation Pinecone..."):
+                    with st.spinner("Indexation..."):
                         nb_c, nb_p = indexer_pdf(pdf_up, nom_f)
-                    st.success(str(nb_p) + " pages — " + str(nb_c) + " chunks ✅")
+                    st.success(str(nb_p) + " pages — " + str(nb_c) + " chunks")
                     st.rerun()
 
     st.divider()
     st.header("📚 Documents")
-    total = get_total_count()
-    if total > 0:
-        sources_dict = get_sources_list()
-        for src, nb in sources_dict.items():
+    if collection.count() > 0:
+        tous = collection.get(include=["metadatas"])
+        srcs = list(set(m["source"] for m in tous["metadatas"]))
+        for src in srcs:
+            nb = sum(1 for m in tous["metadatas"] if m["source"] == src)
             st.markdown("• " + src + " (" + str(nb) + ")")
-        st.metric("Total chunks", total)
+        st.metric("Total chunks", collection.count())
     else:
         st.info("Aucun document")
 
@@ -853,7 +758,7 @@ elif choix == "🏠 Accueil":
 # ══════════════════════════════════════════════════════════
 elif choix == "💬 Assistant Q&A":
     st.subheader("💬 Assistant Q&A Médical")
-    if get_total_count() == 0:
+    if collection.count() == 0:
         st.info("Aucun document disponible. L'admin doit uploader des PDFs.")
         st.stop()
 
@@ -903,13 +808,18 @@ elif choix == "💬 Assistant Q&A":
                 st.info("ℹ️ Consultez votre professionnel de santé.")
 
         st.session_state.messages.append({"role": "assistant", "content": reponse})
+        techniques_actives = []
+        if use_hyde: techniques_actives.append("HyDE")
+        if use_hybrid: techniques_actives.append("Hybrid Search")
+        if use_reranking: techniques_actives.append("Re-ranking")
+        sauvegarder_log(username, role, question, reponse, sources_f, techniques_actives)
 
 # ══════════════════════════════════════════════════════════
 # RAG 2 — FORMATEUR
 # ══════════════════════════════════════════════════════════
 elif choix == "📋 Formateur":
     st.subheader("📋 Formateur de Procédures")
-    if get_total_count() == 0:
+    if collection.count() == 0:
         st.info("Aucun document disponible.")
         st.stop()
 
@@ -937,11 +847,12 @@ elif choix == "📋 Formateur":
 # ══════════════════════════════════════════════════════════
 elif choix == "⚖️ Comparateur":
     st.subheader("⚖️ Comparateur de Documents")
-    if get_total_count() == 0:
+    if collection.count() == 0:
         st.info("Aucun document disponible.")
         st.stop()
 
-    srcs = list(get_sources_list().keys())
+    tous = collection.get(include=["metadatas"])
+    srcs = list(set(m["source"] for m in tous["metadatas"]))
     if len(srcs) < 2:
         st.warning("Tu as besoin d'au moins 2 documents pour comparer.")
         st.stop()
@@ -973,7 +884,7 @@ elif choix == "⚖️ Comparateur":
 # ══════════════════════════════════════════════════════════
 elif choix == "📝 Rapports":
     st.subheader("📝 Générateur de Rapports")
-    if get_total_count() == 0:
+    if collection.count() == 0:
         st.info("Aucun document disponible.")
         st.stop()
 
@@ -985,7 +896,8 @@ elif choix == "📝 Rapports":
     sujet          = st.text_area("Sujet et instructions", height=80)
     contexte_libre = st.text_input("Contexte additionnel (optionnel)")
 
-    srcs     = list(get_sources_list().keys())
+    tous = collection.get(include=["metadatas"])
+    srcs = list(set(m["source"] for m in tous["metadatas"]))
     srcs_sel = st.multiselect("Sources (vide = toutes)", srcs)
 
     if st.button("📝 Générer", type="primary") and sujet.strip() and titre.strip():
@@ -1001,3 +913,63 @@ elif choix == "📝 Rapports":
         st.markdown(rapport)
         st.download_button("⬇️ Télécharger", data=rapport, file_name=titre[:20].replace(" ", "_") + "_" + date.today().strftime("%Y%m%d") + ".txt", mime="text/plain")
         st.warning("⚠️ Ce rapport doit être relu et validé avant diffusion officielle.")
+
+
+# ══════════════════════════════════════════════════════════
+# LOGS & TRAÇABILITÉ (admin uniquement)
+# ══════════════════════════════════════════════════════════
+elif choix == "📊 Logs & Traçabilité":
+    st.subheader("📊 Logs & Traçabilité")
+    st.caption("Visible uniquement par l'administrateur")
+
+    logs = charger_logs()
+
+    if not logs:
+        st.info("Aucune requête enregistrée pour le moment.")
+        st.stop()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total requêtes", len(logs))
+    with col2:
+        users_uniques = len(set(l["user"] for l in logs))
+        st.metric("Utilisateurs actifs", users_uniques)
+    with col3:
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        req_today = sum(1 for l in logs if l["timestamp"].startswith(today))
+        st.metric("Requêtes aujourd'hui", req_today)
+    with col4:
+        hyde_count = sum(1 for l in logs if "HyDE" in l.get("techniques", []))
+        st.metric("HyDE utilisé", f"{hyde_count}/{len(logs)}")
+
+    st.divider()
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        filtre_user = st.selectbox("Filtrer par utilisateur", ["Tous"] + list(set(l["user"] for l in logs)))
+    with col2:
+        nb_afficher = st.slider("Nombre de logs", 5, 50, 20)
+
+    logs_filtres = logs if filtre_user == "Tous" else [l for l in logs if l["user"] == filtre_user]
+    logs_affichage = list(reversed(logs_filtres))[:nb_afficher]
+
+    for log in logs_affichage:
+        with st.expander(f"#{log['id']} — {log['timestamp']} — {log['user']} ({log['role']})"):
+            st.markdown(f"**Question :** {log['question']}")
+            st.markdown(f"**Aperçu réponse :** {log['reponse_preview']}...")
+            st.markdown(f"**Sources utilisées ({log['nb_sources']}) :** {', '.join(log['sources'])}")
+            st.markdown(f"**Techniques :** {', '.join(log['techniques']) if log['techniques'] else 'Standard'}")
+
+    st.divider()
+    logs_json = json.dumps(logs, ensure_ascii=False, indent=2)
+    st.download_button(
+        "⬇️ Télécharger tous les logs (JSON)",
+        data=logs_json,
+        file_name=f"rag_logs_{datetime.datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json"
+    )
+    if st.button("🗑️ Effacer tous les logs", type="secondary"):
+        if os.path.exists(LOGS_FILE):
+            os.remove(LOGS_FILE)
+        st.success("Logs effacés.")
+        st.rerun()
