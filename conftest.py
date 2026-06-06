@@ -10,16 +10,13 @@ def mock_external_services():
             {"metadata": {"text": "texte test", "source": "test.pdf"}, "score": 0.9}
         ]
     }
+    mock_pc_instance = MagicMock()
+    mock_pc_instance.list_indexes.return_value = []
+    mock_pc_instance.Index.return_value = mock_index
 
-    with patch('pinecone.Pinecone') as mock_pc, \
-         patch('groq.Groq') as mock_groq, \
-         patch('sentence_transformers.SentenceTransformer') as mock_st, \
-         patch('sentence_transformers.CrossEncoder') as mock_ce:
-
-        mock_pc.return_value.list_indexes.return_value = []
-        mock_pc.return_value.Index.return_value = mock_index
-        mock_groq.return_value = MagicMock()
-        mock_st.return_value = MagicMock()
-        mock_ce.return_value = MagicMock()
-
+    with patch('rag_hub_cloud.Pinecone', return_value=mock_pc_instance), \
+         patch('rag_hub_cloud.client_groq', MagicMock()), \
+         patch('rag_hub_cloud.model_embed', MagicMock()), \
+         patch('rag_hub_cloud.reranker', MagicMock()), \
+         patch('rag_hub_cloud.pine_index', mock_index):
         yield
