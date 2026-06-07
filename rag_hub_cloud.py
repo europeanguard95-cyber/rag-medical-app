@@ -1040,23 +1040,24 @@ elif choix == "🏠 Estimation Immobilière":
                     if agence_p.get("photo_equipe") and len(agence_p["photo_equipe"]) > 100:
                         try:
                             import base64 as b64
+                            import os as _os2
                             from reportlab.platypus import Image as RLImage
-                            import tempfile, os as _os
+                            from PIL import Image as PILImage
                             photo_bytes_dec = b64.b64decode(agence_p["photo_equipe"])
-                            photo_ext = ".jpg" if "jpeg" in agence_p.get("photo_equipe_type","jpeg") else ".png"
-                            tmp_photo = tempfile.NamedTemporaryFile(delete=False, suffix=photo_ext)
-                            tmp_photo.write(photo_bytes_dec)
-                            tmp_photo.close()
+                            pil_img = PILImage.open(_io.BytesIO(photo_bytes_dec))
+                            if pil_img.mode in ("RGBA", "P", "CMYK"):
+                                pil_img = pil_img.convert("RGB")
+                            pil_img = pil_img.resize((900, 360), PILImage.LANCZOS)
+                            fixed_path = "/tmp/equipe_agence.jpg"
+                            pil_img.save(fixed_path, format="JPEG", quality=85)
                             story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
                             story.append(Spacer(1, 8))
-                            nom_ag = agence_p.get("nom", "Notre equipe")
                             story.append(Paragraph("L'equipe qui a realise cette vente", s_sect))
-                            img = RLImage(tmp_photo.name, width=15*cm, height=6*cm)
+                            img = RLImage(fixed_path, width=15*cm, height=6*cm)
                             img.hAlign = "CENTER"
                             story.append(img)
                             story.append(Spacer(1, 6))
                             story.append(Paragraph("Felicitations a toute l'equipe !", s_footer))
-                            _os.unlink(tmp_photo.name)
                         except Exception as photo_err:
                             st.warning("Photo non incluse dans le flyer : " + str(photo_err))
 
