@@ -10,3 +10,5 @@ pinecone
 pandas
 openpyxl
 reportlab
+Pillow
+
