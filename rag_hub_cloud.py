@@ -796,7 +796,7 @@ elif choix == "🏠 Estimation Immobilière":
     if "ventes_immo" not in st.session_state:
         st.session_state.ventes_immo = []
 
-    tab1, tab2, tab3 = st.tabs(["📊 Estimation", "📥 Importer CSV", "✏️ Ajouter une vente"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Estimation", "📥 Importer CSV", "✏️ Ajouter une vente", "⚙️ Paramètres agence"])
 
     with tab1:
         ventes = st.session_state.ventes_immo
@@ -1033,9 +1033,46 @@ elif choix == "🏠 Estimation Immobilière":
                             story.append(Paragraph(ligne.strip(), s_insta))
                     story.append(Spacer(1, 16))
 
-                    story.append(HRFlowable(width="100%", thickness=2, color=BLEU))
+                    story.append(Spacer(1, 16))
+
+                    # ── PHOTO EQUIPE ──
+                    agence_p = st.session_state.get("agence_params", {})
+                    if agence_p.get("photo_equipe"):
+                        try:
+                            import base64 as b64
+                            from reportlab.platypus import Image as RLImage
+                            import tempfile, os as _os
+                            photo_bytes_dec = b64.b64decode(agence_p["photo_equipe"])
+                            photo_ext = ".jpg" if "jpeg" in agence_p.get("photo_equipe_type","jpeg") else ".png"
+                            tmp_photo = tempfile.NamedTemporaryFile(delete=False, suffix=photo_ext)
+                            tmp_photo.write(photo_bytes_dec)
+                            tmp_photo.close()
+                            story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+                            story.append(Spacer(1, 8))
+                            nom_ag = agence_p.get("nom", "Notre equipe")
+                            story.append(Paragraph("L'equipe qui a realise cette vente", s_sect))
+                            img = RLImage(tmp_photo.name, width=15*cm, height=6*cm)
+                            img.hAlign = "CENTER"
+                            story.append(img)
+                            story.append(Spacer(1, 6))
+                            story.append(Paragraph("Felicitations a toute l'equipe !", s_footer))
+                            _os.unlink(tmp_photo.name)
+                        except Exception:
+                            pass
+
                     story.append(Spacer(1, 8))
-                    story.append(Paragraph("Agence Immobiliere Professionnelle | Votre partenaire de confiance", s_footer))
+                    story.append(HRFlowable(width="100%", thickness=2, color=BLEU))
+                    story.append(Spacer(1, 6))
+                    nom_ag    = agence_p.get("nom",       "Agence Immobiliere Professionnelle")
+                    slogan_ag = agence_p.get("slogan",    "Votre partenaire de confiance")
+                    tel_ag    = agence_p.get("telephone", "")
+                    email_ag2 = agence_p.get("email",     "")
+                    site_ag   = agence_p.get("site",      "")
+                    footer_txt = nom_ag + " | " + slogan_ag
+                    contact_txt = " | ".join(filter(None, [tel_ag, email_ag2, site_ag]))
+                    story.append(Paragraph(footer_txt, s_footer))
+                    if contact_txt:
+                        story.append(Paragraph(contact_txt, s_footer))
                     story.append(Paragraph("Ce bien a ete vendu avec succes grace a notre expertise du marche local.", s_footer))
 
                     doc.build(story)
@@ -1058,3 +1095,58 @@ elif choix == "🏠 Estimation Immobilière":
             st.divider()
             st.markdown("**Dernières ventes ajoutées :**")
             st.dataframe(pd.DataFrame(st.session_state.ventes_immo[-5:]), use_container_width=True)
+
+    with tab4:
+        st.markdown("### ⚙️ Paramètres de l'agence")
+        st.caption("Ces informations apparaîtront automatiquement sur tous vos flyers.")
+        st.divider()
+
+        if "agence_params" not in st.session_state:
+            st.session_state.agence_params = {
+                "nom": "", "slogan": "", "telephone": "",
+                "email": "", "site": "", "photo_equipe": None
+            }
+        p = st.session_state.agence_params
+
+        with st.form("form_agence"):
+            col1, col2 = st.columns(2)
+            with col1:
+                nom_agence  = st.text_input("Nom de l'agence",  value=p.get("nom", ""),       placeholder="Immobilier Excellence")
+                slogan      = st.text_input("Slogan",            value=p.get("slogan", ""),    placeholder="Votre partenaire de confiance")
+                telephone   = st.text_input("Téléphone",         value=p.get("telephone", ""), placeholder="01 23 45 67 89")
+            with col2:
+                email_ag    = st.text_input("Email",             value=p.get("email", ""),     placeholder="contact@agence.fr")
+                site        = st.text_input("Site web",          value=p.get("site", ""),      placeholder="www.agence-excellence.fr")
+
+            st.divider()
+            st.markdown("**📸 Photo de l'équipe**")
+            st.caption("Cette photo sera intégrée dans tous vos flyers de vente.")
+            photo_upload = st.file_uploader("Uploader la photo de l'équipe", type=["jpg", "jpeg", "png"])
+
+            sauver = st.form_submit_button("💾 Sauvegarder les paramètres", type="primary", use_container_width=True)
+            if sauver:
+                st.session_state.agence_params["nom"]       = nom_agence
+                st.session_state.agence_params["slogan"]    = slogan
+                st.session_state.agence_params["telephone"] = telephone
+                st.session_state.agence_params["email"]     = email_ag
+                st.session_state.agence_params["site"]      = site
+                if photo_upload:
+                    import base64
+                    photo_bytes = photo_upload.read()
+                    photo_b64   = base64.b64encode(photo_bytes).decode()
+                    st.session_state.agence_params["photo_equipe"]      = photo_b64
+                    st.session_state.agence_params["photo_equipe_type"] = photo_upload.type
+                st.success("✅ Paramètres sauvegardés ! Ils seront utilisés dans vos prochains flyers.")
+
+        # Aperçu photo si déjà uploadée
+        if st.session_state.agence_params.get("photo_equipe"):
+            st.divider()
+            st.markdown("**Aperçu de la photo d'équipe :**")
+            import base64
+            photo_data = st.session_state.agence_params["photo_equipe"]
+            photo_type = st.session_state.agence_params.get("photo_equipe_type", "image/jpeg")
+            st.markdown(
+                "<img src='data:" + photo_type + ";base64," + photo_data + "' style='max-width:100%;border-radius:12px;border:2px solid #185FA5'>",
+                unsafe_allow_html=True
+            )
+            st.caption("Cette photo sera intégrée dans vos flyers PDF.")
