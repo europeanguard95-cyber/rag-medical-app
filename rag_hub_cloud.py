@@ -1037,7 +1037,7 @@ elif choix == "🏠 Estimation Immobilière":
 
                     # ── PHOTO EQUIPE ──
                     agence_p = st.session_state.get("agence_params", {})
-                    if agence_p.get("photo_equipe"):
+                    if agence_p.get("photo_equipe") and len(agence_p["photo_equipe"]) > 100:
                         try:
                             import base64 as b64
                             from reportlab.platypus import Image as RLImage
@@ -1057,8 +1057,8 @@ elif choix == "🏠 Estimation Immobilière":
                             story.append(Spacer(1, 6))
                             story.append(Paragraph("Felicitations a toute l'equipe !", s_footer))
                             _os.unlink(tmp_photo.name)
-                        except Exception:
-                            pass
+                        except Exception as photo_err:
+                            st.warning("Photo non incluse dans le flyer : " + str(photo_err))
 
                     story.append(Spacer(1, 8))
                     story.append(HRFlowable(width="100%", thickness=2, color=BLEU))
