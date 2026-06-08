@@ -195,12 +195,38 @@ def charger_modeles():
 client_groq, model_embed, reranker, pine_index = charger_modeles()
 
 def chunker(texte, taille=500, overlap=80):
-    chunks, debut = [], 0
-    while debut < len(texte):
-        chunk = texte[debut:debut+taille]
-        if chunk.strip():
-            chunks.append(chunk)
-        debut += taille - overlap
+    """Chunking sémantique : découpe sur les ruptures naturelles avant de tomber sur les caractères."""
+    import re as _re
+    # Nettoyer le texte
+    texte = _re.sub(r'\n{3,}', '\n\n', texte)
+    # Découpe sur paragraphes (double saut de ligne)
+    paragraphes = [p.strip() for p in texte.split('\n\n') if p.strip()]
+    if not paragraphes:
+        paragraphes = [texte]
+    chunks, bloc, taille_bloc = [], [], 0
+    for para in paragraphes:
+        if taille_bloc + len(para) > taille and bloc:
+            chunk_txt = '\n\n'.join(bloc)
+            if chunk_txt.strip():
+                chunks.append(chunk_txt)
+            # Overlap : garder le dernier paragraphe
+            bloc = bloc[-1:] + [para]
+            taille_bloc = sum(len(p) for p in bloc)
+        else:
+            bloc.append(para)
+            taille_bloc += len(para)
+    if bloc:
+        chunk_txt = '\n\n'.join(bloc)
+        if chunk_txt.strip():
+            chunks.append(chunk_txt)
+    # Fallback si aucun chunk
+    if not chunks:
+        debut = 0
+        while debut < len(texte):
+            c = texte[debut:debut+taille]
+            if c.strip():
+                chunks.append(c)
+            debut += taille - overlap
     return chunks
 
 def indexer_pdf(fichier_upload, nom_fichier):
@@ -392,6 +418,8 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Techniques avancées")
+    use_memoire      = st.toggle("🧠 Mémoire",      value=True, help="Mémorise les 3 derniers échanges pour contextualiser les questions de suivi")
+    use_decomposition = st.toggle("🔀 Décomposition", value=False, help="Décompose les questions complexes en sous-questions (plus lent mais plus complet)")
     use_hyde      = st.toggle("🔮 HyDE",         value=True, help="Génère une réponse hypothétique avant de chercher")
     use_hybrid    = st.toggle("🔍 Hybrid Search", value=True, help="Combine recherche vectorielle + mots-clés BM25")
     use_reranking = st.toggle("⚡ Re-ranking",    value=True, help="Re-score les chunks pour plus de précision")
@@ -632,8 +660,9 @@ elif choix == "💬 Assistant Q&A":
             st.markdown(question)
         with st.chat_message("assistant"):
             with st.spinner("Pipeline RAG en cours..."):
-                reponse, chunks_f, sources_f, hyde_text = rag_query(
-                    question, role, n_chunks, use_hyde, use_hybrid, use_reranking
+                reponse, chunks_f, sources_f, hyde_text, score_conf = rag_query(
+                    question, role, n_chunks, use_hyde, use_hybrid, use_reranking,
+                    sources_filtres=sources_filtres, use_memoire=use_memoire, use_decomposition=use_decomposition
                 )
             st.markdown(reponse)
             with st.expander("🔬 Détail du pipeline"):
@@ -641,6 +670,14 @@ elif choix == "💬 Assistant Q&A":
                     st.markdown("**🔮 HyDE activé**")
                     st.caption(hyde_text[:200] + "...")
                     st.divider()
+                # Score de confiance
+                if score_conf >= 0.7:
+                    conf_color, conf_label = "🟢", "Élevée"
+                elif score_conf >= 0.4:
+                    conf_color, conf_label = "🟡", "Moyenne"
+                else:
+                    conf_color, conf_label = "🔴", "Faible"
+                st.caption(conf_color + " Confiance : " + conf_label + " (" + "{:.0%}".format(score_conf) + ")")
                 st.markdown("**🔍 Hybrid Search :** " + ("activé" if use_hybrid else "désactivé"))
                 st.markdown("**⚡ Re-ranking :** " + ("activé" if use_reranking else "désactivé"))
             if droits["voir_sources"]:
@@ -831,6 +868,10 @@ elif choix == "🏠 Estimation Immobilière":
 
     if "ventes_immo" not in st.session_state:
         st.session_state.ventes_immo = charger_ventes()
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "analytics" not in st.session_state:
+        st.session_state.analytics = {"total_questions": 0, "sans_reponse": 0, "modules": {}, "scores": []}
 
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Estimation", "📥 Importer CSV", "✏️ Ajouter une vente", "⚙️ Paramètres agence"])
 
