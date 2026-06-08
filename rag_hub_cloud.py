@@ -793,8 +793,44 @@ elif choix == "🏠 Estimation Immobilière":
     import pandas as pd
     import io as _io
 
+    # ── Persistance des données sur disque ──
+    VENTES_FILE  = "/tmp/ventes_agence.json"
+    AGENCE_FILE  = "/tmp/agence_params.json"
+    PHOTO_FILE   = "/tmp/agence_photo.jpg"
+
+    import json as _json
+
+    def sauver_ventes():
+        try:
+            with open(VENTES_FILE, "w", encoding="utf-8") as f:
+                _json.dump(st.session_state.ventes_immo, f, ensure_ascii=False)
+        except: pass
+
+    def charger_ventes():
+        try:
+            if os.path.exists(VENTES_FILE):
+                with open(VENTES_FILE, "r", encoding="utf-8") as f:
+                    return _json.load(f)
+        except: pass
+        return []
+
+    def sauver_agence_params():
+        try:
+            params_to_save = {k: v for k, v in st.session_state.agence_params.items() if k != "photo_equipe"}
+            with open(AGENCE_FILE, "w", encoding="utf-8") as f:
+                _json.dump(params_to_save, f, ensure_ascii=False)
+        except: pass
+
+    def charger_agence_params():
+        try:
+            if os.path.exists(AGENCE_FILE):
+                with open(AGENCE_FILE, "r", encoding="utf-8") as f:
+                    return _json.load(f)
+        except: pass
+        return {"nom": "", "slogan": "", "telephone": "", "email": "", "site": "", "photo_equipe": None}
+
     if "ventes_immo" not in st.session_state:
-        st.session_state.ventes_immo = []
+        st.session_state.ventes_immo = charger_ventes()
 
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Estimation", "📥 Importer CSV", "✏️ Ajouter une vente", "⚙️ Paramètres agence"])
 
@@ -903,7 +939,8 @@ elif choix == "🏠 Estimation Immobilière":
                     st.dataframe(df_import.head(10), use_container_width=True)
                     if st.button("✅ Valider et ajouter à la base", type="primary"):
                         st.session_state.ventes_immo.extend(df_import.to_dict(orient="records"))
-                        st.success(str(len(df_import)) + " ventes ajoutées ! Total : " + str(len(st.session_state.ventes_immo)))
+                        sauver_ventes()
+                        st.success(str(len(df_import)) + " ventes ajoutées ! Total : " + str(len(st.session_state.ventes_immo)) + " — sauvegardées sur disque ✅")
                         st.rerun()
             except Exception as e:
                 st.error("Erreur import : " + str(e))
@@ -912,6 +949,7 @@ elif choix == "🏠 Estimation Immobilière":
             st.metric("Ventes en base", len(st.session_state.ventes_immo))
             if st.button("🗑️ Vider la base", type="secondary"):
                 st.session_state.ventes_immo = []
+                sauver_ventes()
                 st.rerun()
 
     with tab3:
@@ -1103,10 +1141,13 @@ elif choix == "🏠 Estimation Immobilière":
         st.divider()
 
         if "agence_params" not in st.session_state:
-            st.session_state.agence_params = {
-                "nom": "", "slogan": "", "telephone": "",
-                "email": "", "site": "", "photo_equipe": None
-            }
+            st.session_state.agence_params = charger_agence_params()
+            # Charger photo depuis disque si elle existe
+            if os.path.exists(PHOTO_FILE) and not st.session_state.agence_params.get("photo_equipe"):
+                import base64
+                with open(PHOTO_FILE, "rb") as f:
+                    st.session_state.agence_params["photo_equipe"] = base64.b64encode(f.read()).decode()
+                    st.session_state.agence_params["photo_equipe_type"] = "image/jpeg"
         p = st.session_state.agence_params
 
         with st.form("form_agence"):
@@ -1137,7 +1178,12 @@ elif choix == "🏠 Estimation Immobilière":
                     photo_b64   = base64.b64encode(photo_bytes).decode()
                     st.session_state.agence_params["photo_equipe"]      = photo_b64
                     st.session_state.agence_params["photo_equipe_type"] = photo_upload.type
-                st.success("✅ Paramètres sauvegardés ! Ils seront utilisés dans vos prochains flyers.")
+                    # Sauvegarder photo sur disque
+                    with open(PHOTO_FILE, "wb") as f:
+                        f.write(photo_bytes)
+                # Sauvegarder paramètres sur disque
+                sauver_agence_params()
+                st.success("✅ Paramètres sauvegardés définitivement — ils survivront aux redémarrages !")
 
         # Aperçu photo si déjà uploadée
         if st.session_state.agence_params.get("photo_equipe"):
