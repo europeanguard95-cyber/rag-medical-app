@@ -840,86 +840,198 @@ elif choix == "🏠 Estimation Immobilière":
             st.info("Aucune vente enregistrée. Importez un CSV ou ajoutez des ventes manuellement.")
         else:
             st.markdown("**Décrivez le bien à estimer :**")
+            st.caption("Tous les champs marqués * sont obligatoires pour une estimation fiable.")
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                surface    = st.number_input("Surface (m²)", min_value=10, max_value=500, value=75)
-                nb_pieces  = st.selectbox("Nombre de pièces", [1, 2, 3, 4, 5, 6], index=2)
-            with col2:
-                adresse_bien = st.text_input("Adresse complète", placeholder="Ex: 12 rue de la Paix, Centre-Ville")
-                quartier     = adresse_bien.split(",")[-1].strip() if "," in adresse_bien else adresse_bien
+                adresse_bien = st.text_input("📍 Adresse complète *", placeholder="Ex: 12 rue de la Paix, Centre-Ville")
+                surface      = st.number_input("Surface (m²) *", min_value=10, max_value=500, value=75)
+                nb_pieces    = st.selectbox("Nombre de pièces", [1, 2, 3, 4, 5, 6], index=2)
                 type_bien    = st.selectbox("Type de bien", ["Appartement", "Maison", "Studio", "Loft", "Autre"])
+            with col2:
+                etage        = st.number_input("Étage", min_value=0, max_value=30, value=2)
+                ascenseur    = st.checkbox("Ascenseur", value=True)
+                exposition   = st.selectbox("Exposition", ["Sud", "Est", "Ouest", "Nord", "Sud-Est", "Sud-Ouest", "Non précisé"])
+                exterieur    = st.selectbox("Extérieur", ["Aucun", "Balcon", "Terrasse", "Jardin", "Terrasse + Jardin"])
             with col3:
-                etage      = st.number_input("Étage", min_value=0, max_value=30, value=2)
-                annee_bien = st.number_input("Année de construction", min_value=1800, max_value=2024, value=1990)
+                dpe          = st.selectbox("DPE (performance énergétique)", ["A", "B", "C", "D", "E", "F", "G", "Non précisé"])
+                etat_bien    = st.selectbox("État général du bien", ["Excellent (refait à neuf)", "Bon (bien entretenu)", "Moyen (quelques travaux)", "À rénover (gros travaux)"])
+                parking      = st.checkbox("Parking / Box inclus", value=False)
+                annee_bien   = st.number_input("Année de construction", min_value=1800, max_value=2025, value=1990)
 
             if st.button("🔍 Estimer le prix", type="primary"):
-                with st.spinner("Analyse des ventes comparables..."):
-                    df = pd.DataFrame(ventes)
-                    comparables = df.copy()
-                    if "type_bien" in df.columns:
-                        comparables = comparables[comparables["type_bien"].str.lower() == type_bien.lower()]
-                    if quartier and "quartier" in df.columns:
-                        mask_q = comparables["quartier"].str.lower().str.contains(quartier.lower(), na=False)
-                        if mask_q.sum() >= 3:
-                            comparables = comparables[mask_q]
-                    if "surface" in df.columns:
-                        mask_s = (comparables["surface"] >= surface * 0.70) & (comparables["surface"] <= surface * 1.30)
-                        if mask_s.sum() >= 3:
-                            comparables = comparables[mask_s]
-                    nb_comp = len(comparables)
-                    if nb_comp == 0:
-                        st.warning("Pas assez de ventes comparables. Essayez des critères moins restrictifs.")
-                    else:
-                        comparables["prix_m2"] = comparables["prix"] / comparables["surface"]
-                        prix_m2_moyen = comparables["prix_m2"].mean()
-                        prix_m2_min   = comparables["prix_m2"].quantile(0.25)
-                        prix_m2_max   = comparables["prix_m2"].quantile(0.75)
-                        est      = prix_m2_moyen * surface
-                        est_min  = prix_m2_min   * surface
-                        est_max  = prix_m2_max   * surface
+                if not adresse_bien.strip():
+                    st.error("⚠️ L'adresse est obligatoire pour une estimation fiable.")
+                else:
+                    quartier = adresse_bien.split(",")[-1].strip() if "," in adresse_bien else adresse_bien.strip()
 
-                        st.divider()
-                        st.markdown("### 💰 Résultat de l'estimation")
-                        c1, c2, c3 = st.columns(3)
-                        with c1: st.metric("Estimation basse",    "{:,.0f} €".format(est_min).replace(",", " "))
-                        with c2: st.metric("Estimation centrale", "{:,.0f} €".format(est).replace(",", " "),    delta="référence")
-                        with c3: st.metric("Estimation haute",    "{:,.0f} €".format(est_max).replace(",", " "))
-                        st.metric("Prix au m² moyen", "{:,.0f} €/m²".format(prix_m2_moyen).replace(",", " "), delta=str(nb_comp) + " ventes comparables")
+                    with st.spinner("Analyse multi-critères en cours..."):
+                        df_v = pd.DataFrame(ventes)
 
-                        st.divider()
-                        st.markdown("### 📋 Ventes comparables")
-                        top = comparables.sort_values("prix_m2").head(10)
-                        for _, row in top.iterrows():
-                            label = str(row.get("adresse", "Bien")) + " — " + "{:,.0f} €".format(row["prix"]).replace(",", " ") + " (" + str(int(row["surface"])) + " m²)"
-                            with st.expander(label):
-                                ca, cb, cc, cd = st.columns(4)
-                                with ca: st.metric("Prix",     "{:,.0f} €".format(row["prix"]).replace(",", " "))
-                                with cb: st.metric("Surface",  str(int(row["surface"])) + " m²")
-                                with cc: st.metric("Prix/m²",  "{:,.0f} €".format(row["prix_m2"]).replace(",", " "))
-                                with cd: st.metric("Quartier", str(row.get("quartier", "N/A")))
+                        # ── 1. FILTRAGE COMPARABLES ──
+                        comparables = df_v.copy()
+                        if "type_bien" in df_v.columns:
+                            mask_t = comparables["type_bien"].str.lower() == type_bien.lower()
+                            if mask_t.sum() >= 3:
+                                comparables = comparables[mask_t]
+                        if quartier and "quartier" in df_v.columns:
+                            mask_q = comparables["quartier"].str.lower().str.contains(quartier.lower(), na=False)
+                            if mask_q.sum() >= 3:
+                                comparables = comparables[mask_q]
+                        if "surface" in df_v.columns:
+                            mask_s = (comparables["surface"] >= surface * 0.65) & (comparables["surface"] <= surface * 1.35)
+                            if mask_s.sum() >= 3:
+                                comparables = comparables[mask_s]
 
-                        st.divider()
-                        st.markdown("### 📈 Analyse du marché local")
-                        ctx_ventes = "\n".join([
-                            "- " + str(r.get("adresse","Bien")) + ": " + str(int(r["surface"])) + "m2, " +
-                            str(r.get("nb_pieces","?")) + " pieces, " + str(r.get("quartier","?")) +
-                            " -> " + "{:,.0f}EUR ({:,.0f}EUR/m2)".format(r["prix"], r["prix_m2"]).replace(",", " ")
-                            for _, r in top.iterrows()
-                        ])
-                        prompt_rap = (
-                            "Tu es expert immobilier. Analyse ces ventes et redige un rapport professionnel. "
-                            "Bien a estimer: " + type_bien + ", " + str(surface) + "m2, " + str(nb_pieces) + " pieces, " +
-                            (quartier if quartier else "quartier non precise") + ", etage " + str(etage) + ", annee " + str(annee_bien) + ". "
-                            "Ventes comparables (" + str(nb_comp) + "): " + ctx_ventes + ". "
-                            "Estimation calculee: basse " + "{:,.0f}EUR".format(est_min).replace(",", " ") +
-                            ", centrale " + "{:,.0f}EUR".format(est).replace(",", " ") +
-                            ", haute " + "{:,.0f}EUR".format(est_max).replace(",", " ") + ". "
-                            "Redige avec sections: Synthese, Analyse marche local, Facteurs prix, Recommandation, Points de vigilance."
-                        )
-                        rapport = appeler_llm([{"role": "user", "content": prompt_rap}], max_tokens=800)
-                        st.markdown(rapport)
-                        st.download_button("⬇️ Télécharger le rapport", data=rapport,
-                            file_name="estimation_" + str(surface) + "m2.txt", mime="text/plain")
+                        nb_comp = len(comparables)
+                        if nb_comp == 0:
+                            st.warning("Pas assez de ventes comparables pour ce secteur. Essayez avec plus de ventes ou des critères plus larges.")
+                        else:
+                            comparables = comparables.copy()
+                            comparables["prix_m2"] = comparables["prix"] / comparables["surface"]
+                            prix_m2_base  = comparables["prix_m2"].mean()
+                            prix_m2_q25   = comparables["prix_m2"].quantile(0.25)
+                            prix_m2_q75   = comparables["prix_m2"].quantile(0.75)
+
+                            # ── 2. CALCUL BONUS / MALUS ──
+                            coeff = 1.0
+                            detail_ajust = []
+
+                            # Étage
+                            if etage == 0:
+                                coeff -= 0.05
+                                detail_ajust.append("RDC sans jardin : -5%")
+                            elif etage >= 4 and ascenseur:
+                                coeff += 0.03
+                                detail_ajust.append("Étage élevé + ascenseur : +3%")
+                            elif etage >= 4 and not ascenseur:
+                                coeff -= 0.04
+                                detail_ajust.append("Étage élevé sans ascenseur : -4%")
+                            elif etage >= 2 and ascenseur:
+                                coeff += 0.01
+                                detail_ajust.append("Étage intermédiaire + ascenseur : +1%")
+
+                            # Exposition
+                            if exposition in ["Sud", "Sud-Est", "Sud-Ouest"]:
+                                coeff += 0.03
+                                detail_ajust.append("Exposition favorable : +3%")
+                            elif exposition == "Nord":
+                                coeff -= 0.02
+                                detail_ajust.append("Exposition Nord : -2%")
+
+                            # Extérieur
+                            if exterieur == "Balcon":
+                                coeff += 0.04
+                                detail_ajust.append("Balcon : +4%")
+                            elif exterieur == "Terrasse":
+                                coeff += 0.08
+                                detail_ajust.append("Terrasse : +8%")
+                            elif exterieur == "Jardin":
+                                coeff += 0.10
+                                detail_ajust.append("Jardin : +10%")
+                            elif exterieur == "Terrasse + Jardin":
+                                coeff += 0.14
+                                detail_ajust.append("Terrasse + Jardin : +14%")
+
+                            # DPE
+                            if dpe in ["A", "B"]:
+                                coeff += 0.05
+                                detail_ajust.append("Excellent DPE (" + dpe + ") : +5%")
+                            elif dpe == "C":
+                                coeff += 0.02
+                                detail_ajust.append("Bon DPE (C) : +2%")
+                            elif dpe == "F":
+                                coeff -= 0.08
+                                detail_ajust.append("Mauvais DPE (F) : -8%")
+                            elif dpe == "G":
+                                coeff -= 0.15
+                                detail_ajust.append("Très mauvais DPE (G) : -15%")
+
+                            # État général
+                            if etat_bien.startswith("Excellent"):
+                                coeff += 0.06
+                                detail_ajust.append("État excellent : +6%")
+                            elif etat_bien.startswith("Moyen"):
+                                coeff -= 0.07
+                                detail_ajust.append("Travaux à prévoir : -7%")
+                            elif etat_bien.startswith("À rénover"):
+                                coeff -= 0.18
+                                detail_ajust.append("À rénover : -18%")
+
+                            # Parking
+                            if parking:
+                                coeff += 0.04
+                                detail_ajust.append("Parking inclus : +4%")
+
+                            # ── 3. CALCUL FINAL ──
+                            prix_m2_ajuste = prix_m2_base * coeff
+                            est            = prix_m2_ajuste * surface
+                            est_min        = prix_m2_q25 * coeff * surface
+                            est_max        = prix_m2_q75 * coeff * surface
+                            variation_pct  = (coeff - 1.0) * 100
+
+                            # ── 4. AFFICHAGE ──
+                            st.divider()
+                            st.markdown("### 💰 Résultat de l'estimation multi-critères")
+
+                            c1, c2, c3 = st.columns(3)
+                            with c1: st.metric("Estimation basse",    "{:,.0f} €".format(est_min).replace(",", " "))
+                            with c2: st.metric("Estimation centrale", "{:,.0f} €".format(est).replace(",", " "), delta="{:+.1f}% vs marché brut".format(variation_pct))
+                            with c3: st.metric("Estimation haute",    "{:,.0f} €".format(est_max).replace(",", " "))
+                            st.metric("Prix au m² ajusté", "{:,.0f} €/m²".format(prix_m2_ajuste).replace(",", " "), delta="Base marché : {:,.0f} €/m²".format(prix_m2_base).replace(",", " "))
+
+                            # Ajustements appliqués
+                            if detail_ajust:
+                                with st.expander("🔧 Ajustements appliqués (" + "{:+.1f}%".format(variation_pct) + " au total)"):
+                                    for d in detail_ajust:
+                                        st.markdown("• " + d)
+                                    st.markdown("**Coefficient global : x" + "{:.3f}".format(coeff) + "**")
+
+                            # Comparables
+                            st.divider()
+                            st.markdown("### 📋 Ventes comparables utilisées (" + str(nb_comp) + ")")
+                            top = comparables.sort_values("prix_m2").head(10)
+                            for _, row in top.iterrows():
+                                label = str(row.get("adresse", "Bien")) + " — " + "{:,.0f} €".format(row["prix_m2"]).replace(",", " ") + " €/m²"
+                                with st.expander(label):
+                                    ca, cb, cc, cd = st.columns(4)
+                                    with ca: st.metric("Prix",     "{:,.0f} €".format(row["prix"]).replace(",", " "))
+                                    with cb: st.metric("Surface",  str(int(row["surface"])) + " m²")
+                                    with cc: st.metric("Prix/m²",  "{:,.0f} €/m²".format(row["prix_m2"]).replace(",", " "))
+                                    with cd: st.metric("Quartier", str(row.get("quartier", "N/A")))
+
+                            # Rapport LLM
+                            st.divider()
+                            st.markdown("### 📈 Rapport d'expertise")
+                            ctx_ventes = "\n".join([
+                                "- " + str(r.get("adresse","Bien")) + ": " + str(int(r["surface"])) + "m2, " +
+                                str(r.get("nb_pieces","?")) + " pieces, " + str(r.get("quartier","?")) +
+                                " -> " + "{:,.0f}EUR ({:,.0f}EUR/m2)".format(r["prix"], r["prix_m2"]).replace(",", " ")
+                                for _, r in top.iterrows()
+                            ])
+                            ajust_str = ", ".join(detail_ajust) if detail_ajust else "aucun ajustement"
+                            prompt_rap = (
+                                "Tu es expert immobilier senior. Redige un rapport professionnel d'estimation en francais. "
+                                "Bien a estimer: " + type_bien + ", " + str(surface) + "m2, " + str(nb_pieces) + " pieces, "
+                                "adresse: " + adresse_bien + ", etage " + str(etage) +
+                                (", avec ascenseur" if ascenseur else ", sans ascenseur") +
+                                ", exposition " + exposition + ", exterieur: " + exterieur +
+                                ", DPE " + dpe + ", etat: " + etat_bien +
+                                (", parking inclus" if parking else "") + ". "
+                                "Ajustements appliques: " + ajust_str + " (coefficient global: " + "{:.3f}".format(coeff) + "). "
+                                "Ventes comparables (" + str(nb_comp) + "): " + ctx_ventes + ". "
+                                "Estimation: basse " + "{:,.0f}EUR".format(est_min).replace(",", " ") +
+                                ", centrale " + "{:,.0f}EUR".format(est).replace(",", " ") +
+                                ", haute " + "{:,.0f}EUR".format(est_max).replace(",", " ") + ". "
+                                "Prix/m2 base marche: " + "{:,.0f}EUR/m2".format(prix_m2_base).replace(",", " ") +
+                                ", ajuste: " + "{:,.0f}EUR/m2".format(prix_m2_ajuste).replace(",", " ") + ". "
+                                "Sections: Synthese, Analyse marche local, Facteurs influencant le prix (bonus/malus appliques), "
+                                "Recommandation strategique, Points de vigilance."
+                            )
+                            rapport = appeler_llm([{"role": "user", "content": prompt_rap}], max_tokens=1200)
+                            st.markdown(rapport)
+                            st.download_button("⬇️ Télécharger le rapport", data=rapport,
+                                file_name="estimation_" + adresse_bien[:30].replace(" ", "_") + ".txt", mime="text/plain")
 
     with tab2:
         st.markdown("**Format CSV attendu :**")
